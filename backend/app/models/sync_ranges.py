@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import DateTime, ForeignKey, func, Index, CheckConstraint
-from sqlalchemy.dialects.postgresql import EXCLUDE
+from sqlalchemy.dialects.postgresql import ExcludeConstraint
 from .base import Base
 
 class SyncRange(Base):
@@ -16,9 +16,9 @@ class SyncRange(Base):
     __table_args__ = (
         Index("ix_sync_ranges_asset_time", "asset_id", "start_timestamp", "end_timestamp"),
         CheckConstraint("start_timestamp <= end_timestamp", name="chk_valid_time_range"),
-        EXCLUDE(
+        ExcludeConstraint(
             ("asset_id", "="),
-            ("tstzrange(start_timestamp, end_timestamp, '[]')", "&&"),
+            (func.tstzrange(start_timestamp, end_timestamp, "[]"), "&&"),
             name="exclude_overlapping_ranges",
             using="gist"
         )

@@ -7,13 +7,15 @@ from app.core.config import settings
 
 # Setup Sync Redis for Broker
 redis_client = redis_sync.Redis.from_url(settings.REDIS_URL)
-broker = RedisBroker(url=settings.REDIS_URL)
-
-# Add Middleware
-broker.add_middleware(Retries(max_retries=5))
-broker.add_middleware(TimeLimit(time_limit=3600000)) # 1 hour max
-broker.add_middleware(AgeLimit(max_age=86400000)) # 1 day max in queue
-broker.add_middleware(Callbacks())
+broker = RedisBroker(
+    url=settings.REDIS_URL,
+    middleware=[
+        Retries(max_retries=5),
+        TimeLimit(time_limit=3600000), # 1 hour max
+        AgeLimit(max_age=86400000),    # 1 day max in queue
+        Callbacks(),
+    ]
+)
 
 dramatiq.set_broker(broker)
 

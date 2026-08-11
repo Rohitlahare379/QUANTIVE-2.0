@@ -13,6 +13,7 @@ engine = create_async_engine(
 AsyncSessionLocal = async_sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
 )
+async_session_maker = AsyncSessionLocal
 
 # Note: For bulk ingestion of millions of candles, DO NOT use ORM models.
 # Instead, use SQLAlchemy Core with `insert().values()` and `executemany` for maximum performance.

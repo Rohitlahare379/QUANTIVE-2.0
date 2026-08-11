@@ -31,3 +31,6 @@ limiter = Limiter(
 async def get_db() -> AsyncSession:
     async with AsyncSessionLocal() as session:
         yield session
+
+from app.api.auth import verify_api_key
+get_api_key = verify_api_key
