@@ -1,0 +1,47 @@
+groups:
+  - name: quantive_dlq_alerts
+    rules:
+      - alert: DeadLetterQueueWarning
+        expr: dlq_job_count > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dramatiq DLQ is accumulating jobs"
+          description: "There are currently {{ $value }} jobs in the Dead Letter Queue. A worker job permanently failed all retries."
+          
+      - alert: DeadLetterQueueCritical
+        expr: dlq_job_count > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dramatiq DLQ has exceeded 10 jobs"
+          description: "There are currently {{ $value }} jobs in the Dead Letter Queue. Multiple failures detected. Intervention required to prevent data staleness."
+
+      - alert: DeadLetterQueueRot
+        expr: dlq_oldest_job_age_seconds > 3600
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Old DLQ messages detected"
+          description: "The oldest message in the Dead Letter Queue has been sitting unhandled for over 1 hour ({{ $value }} seconds). Check the runbook for asset deactivation or requeuing."
+
+      - alert: CaggRefreshFailed
+        expr: cagg_refresh_failed_jobs > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CAGG Refresh Workflow Failed"
+          description: "There are {{ $value }} CAGG Refresh jobs marked as FAILED in the database. Historical aggregates may be permanently out of sync."
+
+      - alert: CaggRefreshQueueBuildup
+        expr: cagg_refresh_pending_jobs > 50
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CAGG Refresh Worker is falling behind"
+          description: "There are {{ $value }} pending CAGG refresh jobs. The background worker may be stuck or offline."

@@ -1,0 +1,60 @@
+{
+  "title": "Quantive DLQ Monitoring",
+  "panels": [
+    {
+      "title": "DLQ Size (Job Count)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "dlq_job_count",
+          "legendFormat": "Jobs in DLQ"
+        }
+      ],
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          {"color": "green", "value": null},
+          {"color": "orange", "value": 1},
+          {"color": "red", "value": 10}
+        ]
+      }
+    },
+    {
+      "title": "Oldest Message Age",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "dlq_oldest_job_age_seconds / 60",
+          "legendFormat": "Age (Minutes)"
+        }
+      ],
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          {"color": "green", "value": null},
+          {"color": "red", "value": 60}
+        ]
+      }
+    },
+    {
+      "title": "DLQ Jobs By Type",
+      "type": "bargauge",
+      "targets": [
+        {
+          "expr": "dlq_jobs_by_type",
+          "legendFormat": "{{actor_name}}"
+        }
+      ]
+    },
+    {
+      "title": "DLQ Growth Rate (Jobs / min)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(dlq_job_count[5m]) * 60",
+          "legendFormat": "Growth Rate"
+        }
+      ]
+    }
+  ]
+}
