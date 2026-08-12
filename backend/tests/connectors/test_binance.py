@@ -2,9 +2,17 @@ import pytest
 import respx
 import httpx
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
 from app.connectors.binance import BinanceClient
 from app.connectors.exceptions import APIError, RateLimitError, TemporaryBanError, NetworkError
 from app.core.config import settings
+
+@pytest.fixture(autouse=True)
+def mock_global_rate_limiter():
+    """Ensure GlobalRateLimiter tokens are available during connector unit tests."""
+    with patch("app.connectors.rate_limiter.GlobalRateLimiter.acquire", new_callable=AsyncMock) as mock_acq:
+        mock_acq.return_value = True
+        yield mock_acq
 
 @pytest.fixture
 def binance_client():

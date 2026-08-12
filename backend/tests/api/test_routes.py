@@ -11,9 +11,14 @@ async def mock_auth():
 
 @pytest.fixture
 async def async_client():
+    from httpx import ASGITransport
     app.dependency_overrides[verify_api_key] = mock_auth
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    orig_enabled = app.state.limiter.enabled
+    app.state.limiter.enabled = False
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+    app.state.limiter.enabled = orig_enabled
     app.dependency_overrides.clear()
 
 @pytest.mark.asyncio

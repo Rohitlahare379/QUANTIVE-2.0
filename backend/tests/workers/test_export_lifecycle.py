@@ -6,14 +6,10 @@ from app.workers.export import process_export_job
 
 # We simulate the process_export_job logic and inject exceptions at different layers
 
-@pytest.fixture
-def mock_generate(monkeypatch):
-    # Mock the asyncio.run to return a file path
-    # and mock the generation logic itself to just create an empty file
-    def fake_run(coro):
-        return "/tmp/fake.parquet"
-        
-    monkeypatch.setattr("app.workers.export.asyncio.run", fake_run)
+@pytest.fixture(autouse=True)
+def mock_s3_init(monkeypatch):
+    """Bypass bucket creation checks during worker lifecycle unit tests."""
+    monkeypatch.setattr("app.services.s3_storage.S3StorageService._ensure_bucket_exists", lambda self: None)
 
 def test_file_cleanup_on_success(tmp_path, monkeypatch):
     job_id = uuid.uuid4()

@@ -1,6 +1,6 @@
 import pytest
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.query import CandleQueryService, AssetQueryService
 from app.services.exceptions import (
@@ -88,7 +88,7 @@ async def test_stream_normalization(mock_db, mock_asset_repo, mock_candle_repo):
     mock_asset_repo.get_by_id.return_value = AsyncMock()
     
     # Mock stream generator
-    async def mock_stream():
+    async def mock_stream(*args, **kwargs):
         class MockRow:
             def __init__(self):
                 self._mapping = {
@@ -102,7 +102,7 @@ async def test_stream_normalization(mock_db, mock_asset_repo, mock_candle_repo):
         yield MockRow()
         yield MockRow()
         
-    mock_candle_repo.get_candles_stream.return_value = mock_stream()
+    mock_candle_repo.get_candles_stream = MagicMock(side_effect=mock_stream)
     
     service = CandleQueryService(mock_db)
     start = datetime(2023, 1, 1, tzinfo=timezone.utc)

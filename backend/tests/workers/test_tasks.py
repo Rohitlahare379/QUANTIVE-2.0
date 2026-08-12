@@ -1,6 +1,6 @@
 import pytest
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.workers.tasks import (
     _run_sync,
@@ -18,7 +18,7 @@ def mock_redis():
         lock_instance = AsyncMock()
         
         lock_instance.acquire.return_value = True
-        redis_instance.lock.return_value = lock_instance
+        redis_instance.lock = MagicMock(return_value=lock_instance)
         
         mock.return_value = redis_instance
         yield redis_instance, lock_instance

@@ -51,7 +51,7 @@ async def _run_sync(asset_id: int, symbol: str, start_time: datetime, end_time: 
                     raise RetryableError(str(e)) from e
                 except APIError as e:
                     logger.error(f"Permanent API error for {symbol}: {e}. Discarding job.")
-                    return
+                    raise PermanentError(str(e)) from e
     finally:
         try:
             await lock.release()

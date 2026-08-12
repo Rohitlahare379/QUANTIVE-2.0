@@ -15,11 +15,11 @@ def mock_db():
     db.flush = AsyncMock()
     db.add = MagicMock()
     
-    # Mock begin() context manager
+    # Mock begin() context manager (synchronous method returning async context manager)
     begin_mock = AsyncMock()
     begin_mock.__aenter__.return_value = None
     begin_mock.__aexit__.return_value = None
-    db.begin.return_value = begin_mock
+    db.begin = MagicMock(return_value=begin_mock)
     
     return db
 
@@ -105,6 +105,8 @@ async def test_update_sync_ranges_merge(service, mock_db):
     assert added_range.start_timestamp == mock_range.start_timestamp
     assert added_range.end_timestamp == new_end
 
+from app.models.gap_staging_candles import GapStagingCandle
+
 @pytest.mark.asyncio
 async def test_commit_batch_fragments_gaps(service, mock_db):
     # Create payload with a gap
@@ -125,8 +127,8 @@ async def test_commit_batch_fragments_gaps(service, mock_db):
         with patch.object(service, 'update_sync_ranges', new_callable=AsyncMock) as mock_update:
             await service._commit_batch(1, candles)
             
-            # Should bulk insert exactly once with all 4 candles
-            mock_insert.assert_awaited_once_with(candles)
+            # Should bulk insert exactly once with all 4 candles routed to staging for historical timestamps
+            mock_insert.assert_awaited_once_with(candles, target_model=GapStagingCandle)
             
             # Should update sync ranges exactly TWICE because of the 10:02 gap
             assert mock_update.call_count == 2
@@ -176,5 +178,5 @@ async def test_commit_batch_normal_contiguous(service, mock_db):
         with patch.object(service, 'update_sync_ranges', new_callable=AsyncMock) as mock_update:
             await service._commit_batch(1, candles)
             
-            mock_insert.assert_awaited_once_with(candles)
+            mock_insert.assert_awaited_once_with(candles, target_model=GapStagingCandle)
             mock_update.assert_called_once_with(1, t0, t2)
