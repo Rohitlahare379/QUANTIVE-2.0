@@ -412,3 +412,123 @@ async def test_20_connection_rotation():
     await client.disconnect()
     server.close()
     await server.wait_closed()
+
+
+# ============================================================================
+# 21 - 27: Strict Validation & Hook Integration Tests
+# ============================================================================
+
+def test_21_zero_and_negative_prices_rejected():
+    """21. Prices must be strictly positive (> 0); zero or negative values are rejected."""
+    # Zero open price
+    bad_payload_zero = make_binance_kline_payload(open_price="0.0")
+    with pytest.raises(MalformedMessageError, match="Price must be strictly positive"):
+        parse_binance_kline_message(bad_payload_zero)
+
+    # Negative close price
+    bad_payload_neg = make_binance_kline_payload(close_price="-100.0")
+    with pytest.raises(MalformedMessageError, match="Price must be strictly positive"):
+        parse_binance_kline_message(bad_payload_neg)
+
+
+def test_22_negative_volume_rejected():
+    """22. Base and quote volume fields cannot be negative."""
+    bad_payload_vol = make_binance_kline_payload(volume="-0.01")
+    with pytest.raises(MalformedMessageError, match="Volume cannot be negative"):
+        parse_binance_kline_message(bad_payload_vol)
+
+
+def test_23_ohlc_invariants_violations_rejected():
+    """23. OHLC geometric/chronological invariants violations are rejected."""
+    # High < Low
+    bad_high_low = make_binance_kline_payload(high_price="100.0", low_price="200.0", open_price="150.0", close_price="150.0")
+    with pytest.raises(MalformedMessageError, match="High price .* cannot be less than low price"):
+        parse_binance_kline_message(bad_high_low)
+
+    # Open > High
+    bad_open = make_binance_kline_payload(high_price="100.0", low_price="50.0", open_price="120.0", close_price="80.0")
+    with pytest.raises(MalformedMessageError, match="Open price .* must be within"):
+        parse_binance_kline_message(bad_open)
+
+    # Close < Low
+    bad_close = make_binance_kline_payload(high_price="100.0", low_price="50.0", open_price="80.0", close_price="40.0")
+    with pytest.raises(MalformedMessageError, match="Close price .* must be within"):
+        parse_binance_kline_message(bad_close)
+
+    # Close time before start timestamp
+    bad_time = make_binance_kline_payload(start_ms=1672531259999, close_ms=1672531200000)
+    with pytest.raises(MalformedMessageError, match="Close time .* cannot precede start timestamp"):
+        parse_binance_kline_message(bad_time)
+
+
+def test_24_timezone_utc_enforcement():
+    """24. Timestamps are always stored and parsed in UTC timezone."""
+    payload = make_binance_kline_payload(start_ms=1672531200000, close_ms=1672531259999)
+    event = parse_binance_kline_message(payload)
+
+    assert event.timestamp.tzinfo == timezone.utc
+    assert event.close_time.tzinfo == timezone.utc
+    assert event.received_at.tzinfo == timezone.utc
+
+
+@pytest.mark.asyncio
+async def test_25_connector_error_and_lifecycle_hooks():
+    """25. Connector error, lifecycle, and message callbacks are triggered as expected."""
+    opened_called = False
+    closed_called = False
+    final_candle_events = []
+    parser_errors = []
+
+    def on_opened():
+        nonlocal opened_called
+        opened_called = True
+
+    def on_closed(code, reason):
+        nonlocal closed_called
+        closed_called = True
+
+    def on_final(c):
+        final_candle_events.append(c)
+
+    def on_err(frame, err):
+        parser_errors.append((frame, err))
+
+    async def mock_handler(websocket):
+        async for msg in websocket:
+            data = json.loads(msg)
+            if data.get("method") == "SUBSCRIBE":
+                await websocket.send(json.dumps({"result": None, "id": data.get("id")}))
+                # Send invalid frame
+                await websocket.send("INVALID_NOT_JSON")
+                # Send final valid frame
+                await websocket.send(json.dumps(make_binance_kline_payload(is_closed=True)))
+
+    server = await serve(mock_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    mock_url = f"ws://127.0.0.1:{port}"
+
+    client = BinanceWebSocketClient(
+        symbols=["BTCUSDT"],
+        ws_base_url=mock_url,
+        on_connection_opened=on_opened,
+        on_connection_closed=on_closed,
+        on_final_candle=on_final,
+        on_parser_error=on_err,
+    )
+
+    async def consumer():
+        async for c in client.stream_final_candles():
+            break
+
+    consumer_task = asyncio.create_task(consumer())
+    await asyncio.wait_for(consumer_task, timeout=3.0)
+
+    assert opened_called is True
+    assert len(parser_errors) == 1
+    assert len(final_candle_events) == 1
+
+    await client.disconnect()
+    assert closed_called is True
+    server.close()
+    await server.wait_closed()
+

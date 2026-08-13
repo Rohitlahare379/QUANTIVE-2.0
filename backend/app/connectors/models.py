@@ -43,13 +43,33 @@ class CandleEvent(BaseModel):
             raise ValueError("Symbol must be a non-empty string")
         return v.strip().upper()
 
-    @field_validator("open", "high", "low", "close", "volume")
+    @field_validator("timestamp", "close_time", "event_time", "received_at")
     @classmethod
-    def validate_positive_numbers(cls, v: float) -> float:
+    def ensure_utc_datetime(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+
+    @field_validator("open", "high", "low", "close")
+    @classmethod
+    def validate_positive_prices(cls, v: float) -> float:
         if v is None or not isinstance(v, (int, float)):
-            raise ValueError("Price and volume fields must be numeric")
+            raise ValueError("Price fields must be numeric")
+        if v <= 0:
+            raise ValueError(f"Price must be strictly positive (> 0), got {v}")
+        return float(v)
+
+    @field_validator("volume", "quote_volume", "taker_buy_base_volume", "taker_buy_quote_volume")
+    @classmethod
+    def validate_non_negative_volumes(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if not isinstance(v, (int, float)):
+            raise ValueError("Volume fields must be numeric")
         if v < 0:
-            raise ValueError("Price and volume cannot be negative")
+            raise ValueError(f"Volume cannot be negative (>= 0), got {v}")
         return float(v)
 
     @model_validator(mode="after")
