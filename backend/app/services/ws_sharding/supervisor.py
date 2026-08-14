@@ -9,6 +9,7 @@ and clean lease release during graceful shutdown.
 import asyncio
 import logging
 from typing import Callable, Dict, List, Optional, Set
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import settings
 from app.services.ws_sharding.assignment import get_symbols_for_shard
@@ -18,6 +19,7 @@ from app.services.ws_sharding.lease import (
     ShardLeaseManager,
     generate_worker_id,
 )
+from app.services.ws_sharding.registry import AssetRegistryResolver
 from app.services.ws_sharding.runtime import ShardRuntime, ShardRuntimeState
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ class ShardSupervisor:
         lease_manager: Optional[ShardLeaseManager] = None,
         heartbeat_interval_seconds: Optional[float] = None,
         lease_ttl_seconds: Optional[float] = None,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+        asset_resolver: Optional[AssetRegistryResolver] = None,
     ):
         self.worker_id = worker_id or generate_worker_id()
         self.num_shards = num_shards or settings.WS_NUM_SHARDS
@@ -48,6 +52,8 @@ class ShardSupervisor:
         self.heartbeat_interval_seconds = (
             heartbeat_interval_seconds or settings.WS_HEARTBEAT_INTERVAL_SECONDS
         )
+        self.session_factory = session_factory
+        self.asset_resolver = asset_resolver
 
         self.lease_manager = lease_manager or ShardLeaseManager(
             lease_ttl_seconds=self.lease_ttl_seconds
@@ -111,7 +117,9 @@ class ShardSupervisor:
             runtime = ShardRuntime(
                 shard_id=shard_id,
                 symbols=shard_symbols,
-                claim=claim
+                claim=claim,
+                session_factory=self.session_factory,
+                asset_resolver=self.asset_resolver,
             )
             await runtime.start()
 

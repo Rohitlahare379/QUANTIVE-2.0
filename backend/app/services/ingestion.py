@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +15,7 @@ from app.connectors.exceptions import PayloadCorruptionError
 logger = logging.getLogger(__name__)
 
 class IngestionService:
-    def __init__(self, db_session: AsyncSession, binance_client: BinanceClient):
+    def __init__(self, db_session: AsyncSession, binance_client: Optional[BinanceClient] = None):
         self.db = db_session
         self.client = binance_client
 

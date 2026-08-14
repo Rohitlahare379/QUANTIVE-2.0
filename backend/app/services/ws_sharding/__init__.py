@@ -14,6 +14,16 @@ from app.services.ws_sharding.lease import (
     ShardLeaseManager,
     generate_worker_id,
 )
+from app.services.ws_sharding.metrics import (
+    PipelineMetrics,
+)
+from app.services.ws_sharding.pipeline import (
+    BoundedLiveIngestionPipeline,
+    validate_candle_payload,
+)
+from app.services.ws_sharding.registry import (
+    AssetRegistryResolver,
+)
 from app.services.ws_sharding.runtime import (
     ShardRuntime,
     ShardRuntimeState,
@@ -34,4 +44,8 @@ __all__ = [
     "ShardRuntime",
     "ShardRuntimeState",
     "ShardSupervisor",
+    "BoundedLiveIngestionPipeline",
+    "PipelineMetrics",
+    "AssetRegistryResolver",
+    "validate_candle_payload",
 ]

@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     WS_NUM_SHARDS: int = 8
     WS_LEASE_TTL_SECONDS: float = 15.0
     WS_HEARTBEAT_INTERVAL_SECONDS: float = 5.0
+
+    # WebSocket Live Ingestion Pipeline Settings (P0.2 Phase 3)
+    WS_QUEUE_MAXSIZE: int = 10000
+    WS_BATCH_SIZE: int = 1000
+    WS_BATCH_FLUSH_INTERVAL_MS: int = 1000
+    WS_REGISTRY_CACHE_TTL_SECONDS: float = 60.0
+    WS_QUEUE_WARNING_THRESHOLD: float = 0.75
+    WS_QUEUE_DEGRADED_THRESHOLD: float = 0.90
     
     # S3 / MinIO Settings for Historical Exports
     AWS_ACCESS_KEY_ID: str = "minioadmin"
@@ -67,6 +75,12 @@ class Settings(BaseSettings):
             )
         if self.WS_NUM_SHARDS <= 0:
             raise ValueError(f"WS_NUM_SHARDS must be a positive integer, got {self.WS_NUM_SHARDS}")
+        if self.WS_QUEUE_MAXSIZE <= 0:
+            raise ValueError(f"WS_QUEUE_MAXSIZE must be a positive integer, got {self.WS_QUEUE_MAXSIZE}")
+        if self.WS_BATCH_SIZE <= 0:
+            raise ValueError(f"WS_BATCH_SIZE must be a positive integer, got {self.WS_BATCH_SIZE}")
+        if self.WS_BATCH_FLUSH_INTERVAL_MS <= 0:
+            raise ValueError(f"WS_BATCH_FLUSH_INTERVAL_MS must be a positive integer, got {self.WS_BATCH_FLUSH_INTERVAL_MS}")
         return self
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

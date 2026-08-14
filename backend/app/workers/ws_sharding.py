@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from app.core.config import settings
 from app.models.asset_registry import AssetRegistry
+from app.services.ws_sharding.registry import AssetRegistryResolver
 from app.services.ws_sharding.supervisor import ShardSupervisor
 
 logger = logging.getLogger(__name__)
@@ -48,12 +49,24 @@ async def run_ws_shard_supervisor(
     Main execution loop for a WebSocket Shard Supervisor worker process.
     Handles SIGTERM and SIGINT for graceful shutdown and lease release.
     """
+    engine = create_async_engine(
+        settings.sqlalchemy_database_uri,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_pre_ping=True,
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    asset_resolver = AssetRegistryResolver(session_factory=session_factory)
+    await asset_resolver.load_cache()
+
     if symbols is None:
         symbols = await fetch_active_symbols_from_db()
 
     supervisor = ShardSupervisor(
         candidate_shards=candidate_shards,
-        symbols=symbols
+        symbols=symbols,
+        session_factory=session_factory,
+        asset_resolver=asset_resolver,
     )
 
     stop_event = asyncio.Event()
