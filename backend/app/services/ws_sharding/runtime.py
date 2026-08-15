@@ -28,6 +28,9 @@ class ShardRuntimeState(str, enum.Enum):
     STOPPED = "STOPPED"
 
 
+MAX_UNCOMMITTED_BUFFERS = 1000
+
+
 class ShardRuntime:
     """
     Manages the lifecycle of an individual owned shard.
@@ -84,9 +87,14 @@ class ShardRuntime:
     def add_uncommitted_buffer(self, item: Any) -> bool:
         """
         Adds a candle / buffer item to the uncommitted in-memory queue.
-        Returns False if the shard is fenced or not accepting work.
+        Returns False if the shard is fenced, not accepting work, or at capacity.
         """
         if not self.is_accepting_work:
+            return False
+        if len(self._uncommitted_buffers) >= MAX_UNCOMMITTED_BUFFERS:
+            logger.warning(
+                f"[Shard {self.shard_id}] Uncommitted buffer reached max capacity ({MAX_UNCOMMITTED_BUFFERS})."
+            )
             return False
         self._uncommitted_buffers.append(item)
         return True

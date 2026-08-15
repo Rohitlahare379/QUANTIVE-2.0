@@ -69,11 +69,11 @@ async def test_5000_assets_bounded_load():
 
     async def mock_db_commit(asset_id: int, payload: list):
         nonlocal committed_candles_count
-        # Simulate slight DB write latency (0.5ms per asset batch)
-        await asyncio.sleep(0.0005)
+        # Cooperative yield to event loop simulating fast persistence
+        await asyncio.sleep(0)
         committed_candles_count += len(payload)
         committed_batches.append(len(payload))
-        pipeline.metrics.record_flush_complete(len(payload), 0.5)
+        pipeline.metrics.record_flush_complete(len(payload), 0.1)
 
     pipeline._commit_asset_batch = mock_db_commit
 

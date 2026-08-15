@@ -25,6 +25,7 @@ class PipelineMetrics:
     persistence_errors: int = 0
     fenced_events_discarded: int = 0
     queue_overflow_count: int = 0
+    asset_overflow_count: int = 0
     queue_size: int = 0
     queue_utilization_ratio: float = 0.0
     is_degraded: bool = False

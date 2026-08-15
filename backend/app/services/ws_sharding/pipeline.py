@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.connectors.models import CandleEvent
 from app.core.config import settings
-from app.services.ingestion import IngestionService
 from app.services.ws_sharding.metrics import PipelineMetrics
 from app.services.ws_sharding.registry import AssetRegistryResolver
 
@@ -67,6 +66,7 @@ class BoundedLiveIngestionPipeline:
         queue_maxsize: Optional[int] = None,
         batch_size: Optional[int] = None,
         flush_interval_ms: Optional[int] = None,
+        max_pending_per_asset: Optional[int] = None,
         fencing_check: Optional[Callable[[], bool]] = None,
     ):
         self.shard_id = shard_id
@@ -75,11 +75,15 @@ class BoundedLiveIngestionPipeline:
         self.queue_maxsize = queue_maxsize or settings.WS_QUEUE_MAXSIZE
         self.batch_size = batch_size or settings.WS_BATCH_SIZE
         self.flush_interval_seconds = float(flush_interval_ms or settings.WS_BATCH_FLUSH_INTERVAL_MS) / 1000.0
+        self.max_pending_per_asset = max_pending_per_asset or settings.WS_MAX_PENDING_PER_ASSET
         self.fencing_check = fencing_check
 
         # Bounded asyncio Queue
         self._queue: asyncio.Queue[CandleEvent] = asyncio.Queue(maxsize=self.queue_maxsize)
         
+        # Per-Asset Bounded Buffer Tracking
+        self._pending_per_asset: Dict[str, int] = defaultdict(int)
+
         # Operational State
         self.metrics = PipelineMetrics()
         self._is_running = False
@@ -118,25 +122,22 @@ class BoundedLiveIngestionPipeline:
             self.metrics.fenced_events_discarded += 1
             return False
 
-        # 3. Utilization Threshold Evaluation
-        current_size = self._queue.qsize()
-        self.metrics.update_queue_stats(
-            current_size=current_size,
-            max_size=self.queue_maxsize,
-            degraded_threshold=settings.WS_QUEUE_DEGRADED_THRESHOLD,
-        )
-
-        # Degraded Mode (90% capacity) -> Trigger immediate flush
-        if self.metrics.is_degraded:
-            self._flush_trigger_event.set()
+        # 3. Check Per-Asset Buffer Limit (Section 8)
+        if self._pending_per_asset[event.symbol] >= self.max_pending_per_asset:
+            self.metrics.asset_overflow_count += 1
+            logger.warning(
+                f"[Shard {self.shard_id}] Asset {event.symbol} pending queue reached limit "
+                f"({self.max_pending_per_asset}). Rejecting new events until drained."
+            )
+            return False
 
         # 4. Enqueue with Backpressure (100% capacity)
         try:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
             # Apply controlled backpressure by waiting with bounded timeout
+            self._flush_trigger_event.set()
             try:
-                self._flush_trigger_event.set()
                 await asyncio.wait_for(self._queue.put(event), timeout=2.0)
             except (asyncio.TimeoutError, asyncio.QueueFull):
                 self.metrics.queue_overflow_count += 1
@@ -146,15 +147,19 @@ class BoundedLiveIngestionPipeline:
                 )
                 return False
 
+        self._pending_per_asset[event.symbol] += 1
         self.metrics.candles_received += 1
+
+        # 5. Utilization Threshold Evaluation on post-enqueue size
+        current_size = self._queue.qsize()
         self.metrics.update_queue_stats(
-            current_size=self._queue.qsize(),
+            current_size=current_size,
             max_size=self.queue_maxsize,
             degraded_threshold=settings.WS_QUEUE_DEGRADED_THRESHOLD,
         )
 
-        # Flush trigger if batch size reached
-        if self._queue.qsize() >= self.batch_size:
+        # Trigger flush on reaching batch size or degraded mode (90% capacity)
+        if self.metrics.is_degraded or current_size >= self.batch_size:
             self._flush_trigger_event.set()
 
         return True
@@ -213,6 +218,7 @@ class BoundedLiveIngestionPipeline:
             except (asyncio.QueueEmpty, ValueError):
                 break
 
+        self._pending_per_asset.clear()
         self.metrics.fenced_events_discarded += count
         self.metrics.update_queue_stats(0, self.queue_maxsize)
         if count > 0:
@@ -258,6 +264,11 @@ class BoundedLiveIngestionPipeline:
                 item = self._queue.get_nowait()
                 self._queue.task_done()
                 batch.append(item)
+                # Decrement per-asset counter and clean up empty keys
+                if item.symbol in self._pending_per_asset:
+                    self._pending_per_asset[item.symbol] -= 1
+                    if self._pending_per_asset[item.symbol] <= 0:
+                        del self._pending_per_asset[item.symbol]
             except (asyncio.QueueEmpty, ValueError):
                 break
 
@@ -358,12 +369,20 @@ class BoundedLiveIngestionPipeline:
                 for e in deduped_events
             ]
 
-            # 4. Commit via existing IngestionService
-            await self._commit_asset_batch(asset_id, candles_payload)
+            # 4. Commit via existing IngestionService (isolated per asset)
+            try:
+                await self._commit_asset_batch(asset_id, candles_payload)
+            except Exception as e:
+                self.metrics.persistence_errors += 1
+                logger.error(
+                    f"[Shard {self.shard_id}] Failed to commit {len(candles_payload)} candles for asset {asset_id}: {e}",
+                    extra={"shard_id": self.shard_id, "asset_id": asset_id, "error": str(e), "event": "persistence_error"}
+                )
 
     async def _commit_asset_batch(self, asset_id: int, candles_payload: List[Dict[str, Any]]) -> None:
         """
         Commits an asset's candle batch to PostgreSQL using IngestionService._commit_batch.
+        Acquires DB session strictly for the duration of the persistence transaction.
         """
         start_time = time.perf_counter()
 
@@ -374,9 +393,10 @@ class BoundedLiveIngestionPipeline:
             return
 
         try:
+            from app.services.ingestion import IngestionService
             async with self.session_factory() as session:
                 service = IngestionService(db_session=session)
-                await service._commit_batch(asset_id, candles_payload)
+                await asyncio.wait_for(service._commit_batch(asset_id, candles_payload), timeout=10.0)
 
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             self.metrics.record_flush_complete(len(candles_payload), latency_ms)

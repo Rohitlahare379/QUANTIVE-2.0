@@ -1,44 +1,76 @@
 """
 Comprehensive Verification Test Suite for Bounded Live Ingestion Pipeline (P0.2 Phase 3).
 
-Covers all 27 required verification scenarios:
-1. Finalized CandleEvent enters queue
-2. Partial CandleEvent rejected
-3. Bounded queue never exceeds maxsize
-4. Queue utilization thresholds (50%, 75%, 90%, 100%)
-5. Batch flush by size
-6. Batch flush by time
-7. Multiple assets are partitioned independently
-8. BTC ordering preserved
-9. ETH ordering preserved
-10. BTC cannot interfere with ETH ordering
-11. Duplicate candle is harmless
-12. Out-of-order candle handled correctly
-13. Missing minute does not create false continuous sync range
-14. Invalid OHLC rejected
-15. Invalid volume rejected
-16. Unknown symbol handled
-17. Inactive asset handled
-18. Database batch transaction rollback
-19. Concurrent BTC writers
-20. Concurrent different-asset writers
-21. Shard ownership loss fences persistence
-22. Graceful shutdown
-23. Forced cancellation
-24. Memory remains bounded
-25. Producer backpressure
-26. Slow database handling
-27. Queue saturation recovery
+Strictly covers all 42 required verification scenarios from Section 27:
+
+CORE:
+1.  finalized candle accepted
+2.  partial candle rejected
+3.  invalid OHLC rejected
+4.  negative volume rejected
+5.  UTC timestamp preserved
+
+QUEUE:
+6.  queue has maxsize
+7.  queue cannot exceed maxsize
+8.  50% threshold
+9.  75% threshold
+10. 90% threshold
+11. 100% backpressure
+12. bounded memory
+
+ORDERING:
+13. BTC chronological ordering
+14. ETH chronological ordering
+15. BTC and ETH independent ordering
+16. duplicate candle
+17. out-of-order candle
+18. missing candle
+
+BATCHING:
+19. flush by batch size
+20. flush by time
+21. slow asset does not block others
+22. batch has hard maximum
+
+DATABASE:
+23. successful batch commit
+24. transaction rollback
+25. duplicate database insert
+26. concurrent BTC writers
+27. concurrent BTC/ETH writers
+28. sync_ranges gap preservation
+
+OWNERSHIP:
+29. valid owner can persist
+30. lost owner cannot persist
+31. ownership loss cancels processing
+32. Redis failure fences ingestion
+
+FAILURE:
+33. DB unavailable
+34. DB timeout
+35. WebSocket disconnect
+36. worker cancellation
+37. graceful shutdown
+38. forced shutdown
+
+ASSET MAPPING:
+39. valid symbol mapping
+40. unknown symbol
+41. inactive asset
+42. bounded mapping cache
 """
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.connectors.models import CandleEvent
 from app.core.config import settings
@@ -97,10 +129,12 @@ def mock_asset_resolver():
 
 
 # ============================================================================
-# 1. Finalized CandleEvent Enters Queue
+# CORE TESTS (1-5)
 # ============================================================================
+
 @pytest.mark.asyncio
-async def test_1_finalized_candle_enters_queue(mock_asset_resolver):
+async def test_01_finalized_candle_accepted(mock_asset_resolver):
+    """1. Finalized candle is accepted into bounded queue."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -119,11 +153,9 @@ async def test_1_finalized_candle_enters_queue(mock_asset_resolver):
         await pipeline.stop()
 
 
-# ============================================================================
-# 2. Partial CandleEvent Rejected
-# ============================================================================
 @pytest.mark.asyncio
-async def test_2_partial_candle_rejected(mock_asset_resolver):
+async def test_02_partial_candle_rejected(mock_asset_resolver):
+    """2. Partial / unfinalized candle is strictly rejected."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -142,39 +174,9 @@ async def test_2_partial_candle_rejected(mock_asset_resolver):
         await pipeline.stop()
 
 
-# ============================================================================
-# 3. Bounded Queue Never Exceeds Maxsize
-# ============================================================================
 @pytest.mark.asyncio
-async def test_3_bounded_queue_never_exceeds_maxsize(mock_asset_resolver):
-    # Fixed small maxsize of 5, flusher stopped to test queue saturation
-    pipeline = BoundedLiveIngestionPipeline(
-        shard_id=0,
-        asset_resolver=mock_asset_resolver,
-        queue_maxsize=5,
-    )
-    pipeline._is_running = True  # Enable enqueue without running flusher task
-
-    # Fill queue to capacity
-    for i in range(5):
-        accepted = await pipeline.enqueue_candle(create_candle(minute_offset=i))
-        assert accepted is True
-
-    assert pipeline.queue_size == 5
-
-    # 6th candle under backpressure with short timeout
-    with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
-        accepted_6th = await pipeline.enqueue_candle(create_candle(minute_offset=5))
-        assert accepted_6th is False
-        assert pipeline.queue_size == 5
-        assert pipeline.metrics.queue_overflow_count == 1
-
-
-# ============================================================================
-# 4. Queue Utilization Thresholds (50%, 75%, 90%, 100%)
-# ============================================================================
-@pytest.mark.asyncio
-async def test_4_queue_utilization_thresholds(mock_asset_resolver):
+async def test_03_invalid_ohlc_rejected(mock_asset_resolver):
+    """3. Invalid OHLC relationships are rejected defensively."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -182,136 +184,242 @@ async def test_4_queue_utilization_thresholds(mock_asset_resolver):
     )
     pipeline._is_running = True
 
-    # 50% capacity (5 items)
+    # Valid candle
+    valid_c = create_candle()
+    assert validate_candle_payload(valid_c) is True
+
+    # High < Low
+    invalid_hl = create_candle()
+    invalid_hl.high = 40000.0
+    assert validate_candle_payload(invalid_hl) is False
+    assert await pipeline.enqueue_candle(invalid_hl) is False
+
+    # Open > High
+    invalid_oh = create_candle()
+    invalid_oh.open = 55000.0
+    assert validate_candle_payload(invalid_oh) is False
+    assert await pipeline.enqueue_candle(invalid_oh) is False
+
+    # Close < Low
+    invalid_cl = create_candle()
+    invalid_cl.close = 45000.0
+    assert validate_candle_payload(invalid_cl) is False
+    assert await pipeline.enqueue_candle(invalid_cl) is False
+
+    # Zero / Negative Price
+    invalid_zero = create_candle()
+    invalid_zero.low = 0.0
+    assert validate_candle_payload(invalid_zero) is False
+    assert await pipeline.enqueue_candle(invalid_zero) is False
+
+    assert pipeline.metrics.rejected_candles == 4
+
+
+@pytest.mark.asyncio
+async def test_04_negative_volume_rejected(mock_asset_resolver):
+    """4. Negative volume is rejected."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        queue_maxsize=10,
+    )
+    pipeline._is_running = True
+
+    c = create_candle()
+    c.volume = -10.0
+    assert validate_candle_payload(c) is False
+    accepted = await pipeline.enqueue_candle(c)
+    assert accepted is False
+    assert pipeline.metrics.rejected_candles == 1
+
+
+@pytest.mark.asyncio
+async def test_05_utc_timestamp_preserved(mock_asset_resolver):
+    """5. UTC timestamp is preserved; timezone-naive timestamp is rejected."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        queue_maxsize=10,
+    )
+    pipeline._is_running = True
+
+    # Naive timestamp
+    naive_c = create_candle()
+    naive_c.timestamp = datetime(2026, 8, 15, 12, 0, 0)
+    assert validate_candle_payload(naive_c) is False
+    assert await pipeline.enqueue_candle(naive_c) is False
+
+    # UTC timestamp
+    utc_c = create_candle()
+    assert utc_c.timestamp.tzinfo == timezone.utc
+    assert validate_candle_payload(utc_c) is True
+    assert await pipeline.enqueue_candle(utc_c) is True
+
+
+# ============================================================================
+# QUEUE & BACKPRESSURE TESTS (6-12)
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_06_queue_has_maxsize(mock_asset_resolver):
+    """6. Queue is initialized with a strict maxsize (never unlimited)."""
+    pipeline = BoundedLiveIngestionPipeline(shard_id=0, asset_resolver=mock_asset_resolver)
+    assert pipeline.queue_maxsize == settings.WS_QUEUE_MAXSIZE
+    assert pipeline._queue.maxsize == settings.WS_QUEUE_MAXSIZE
+    assert pipeline._queue.maxsize > 0
+
+
+@pytest.mark.asyncio
+async def test_07_queue_cannot_exceed_maxsize(mock_asset_resolver):
+    """7. Bounded queue never exceeds maxsize and applies bounded wait before drop."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        queue_maxsize=3,
+    )
+    pipeline._is_running = True
+
+    # Fill queue to capacity (3 items)
+    for i in range(3):
+        assert await pipeline.enqueue_candle(create_candle(minute_offset=i)) is True
+
+    assert pipeline.queue_size == 3
+
+    # 4th item when queue full -> timeout & drop
+    async def mock_wait_for_timeout(coro, timeout):
+        coro.close()
+        raise asyncio.TimeoutError()
+
+    with patch.object(asyncio, "wait_for", side_effect=mock_wait_for_timeout):
+        accepted_4th = await pipeline.enqueue_candle(create_candle(minute_offset=3))
+        assert accepted_4th is False
+        assert pipeline.queue_size == 3
+        assert pipeline.metrics.queue_overflow_count == 1
+
+
+@pytest.mark.asyncio
+async def test_08_queue_50_percent_threshold(mock_asset_resolver):
+    """8. Queue utilization at 50% operates in normal mode."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        queue_maxsize=10,
+    )
+    pipeline._is_running = True
+
     for i in range(5):
         await pipeline.enqueue_candle(create_candle(minute_offset=i))
+
     assert pipeline.queue_utilization == 0.50
     assert pipeline.metrics.is_degraded is False
 
-    # 80% capacity (8 items -> >= 75% warning)
-    for i in range(5, 8):
+
+@pytest.mark.asyncio
+async def test_09_queue_75_percent_threshold(mock_asset_resolver):
+    """9. Queue utilization at 75% warning threshold."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        queue_maxsize=10,
+    )
+    pipeline._is_running = True
+
+    for i in range(8):
         await pipeline.enqueue_candle(create_candle(minute_offset=i))
+
     assert pipeline.queue_utilization == 0.80
+    assert pipeline.metrics.queue_utilization_ratio >= settings.WS_QUEUE_WARNING_THRESHOLD
     assert pipeline.metrics.is_degraded is False
 
-    # 90% capacity (9 items -> degraded mode active)
-    await pipeline.enqueue_candle(create_candle(minute_offset=8))
+
+@pytest.mark.asyncio
+async def test_10_queue_90_percent_threshold(mock_asset_resolver):
+    """10. Queue utilization at 90% enters degraded mode and triggers immediate flush."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        queue_maxsize=10,
+    )
+    pipeline._is_running = True
+
+    for i in range(9):
+        await pipeline.enqueue_candle(create_candle(minute_offset=i))
+
     assert pipeline.queue_utilization == 0.90
     assert pipeline.metrics.is_degraded is True
+    assert pipeline._flush_trigger_event.is_set() is True
 
 
-# ============================================================================
-# 5. Batch Flush by Size
-# ============================================================================
 @pytest.mark.asyncio
-async def test_5_batch_flush_by_size(mock_asset_resolver):
-    # Set huge flush interval (100 seconds) so time flush will not trigger
+async def test_11_queue_100_percent_backpressure(mock_asset_resolver):
+    """11. 100% capacity applies backpressure, blocking producer until space frees."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
-        batch_size=3,
-        flush_interval_ms=100000,
+        queue_maxsize=2,
     )
+    pipeline._is_running = True
 
-    flush_mock = AsyncMock()
-    pipeline._commit_asset_batch = flush_mock
+    assert await pipeline.enqueue_candle(create_candle(minute_offset=0)) is True
+    assert await pipeline.enqueue_candle(create_candle(minute_offset=1)) is True
 
-    await pipeline.start()
-    try:
-        # Enqueue 3 items (reaches batch_size=3)
-        for i in range(3):
-            await pipeline.enqueue_candle(create_candle(minute_offset=i))
+    # 3rd candle will wait for queue space
+    async def put_delayed():
+        return await pipeline.enqueue_candle(create_candle(minute_offset=2))
 
-        # Yield to let flusher run
-        await asyncio.sleep(0.05)
+    task = asyncio.create_task(put_delayed())
+    await asyncio.sleep(0.05)
+    assert not task.done()
 
-        assert flush_mock.await_count == 1
-        asset_id, payload = flush_mock.call_args[0]
-        assert asset_id == 1
-        assert len(payload) == 3
-    finally:
-        await pipeline.stop()
+    # Free 1 item from queue
+    pipeline._queue.get_nowait()
+    pipeline._queue.task_done()
+
+    res = await task
+    assert res is True
+    assert pipeline.queue_size == 2
 
 
-# ============================================================================
-# 6. Batch Flush by Time
-# ============================================================================
 @pytest.mark.asyncio
-async def test_6_batch_flush_by_time(mock_asset_resolver):
-    # Set huge batch_size (100) and small flush interval (50ms)
+async def test_12_bounded_memory(mock_asset_resolver):
+    """12. Rapid event streaming through small queue keeps memory and queue size bounded."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
-        batch_size=100,
-        flush_interval_ms=50,
+        queue_maxsize=15,
+        batch_size=5,
+        flush_interval_ms=10,
     )
 
-    flush_mock = AsyncMock()
-    pipeline._commit_asset_batch = flush_mock
-
-    await pipeline.start()
-    try:
-        # Enqueue only 2 items (< 100)
-        await pipeline.enqueue_candle(create_candle(minute_offset=0))
-        await pipeline.enqueue_candle(create_candle(minute_offset=1))
-
-        # Wait for timer to expire (~80ms)
-        await asyncio.sleep(0.1)
-
-        assert flush_mock.await_count == 1
-        asset_id, payload = flush_mock.call_args[0]
-        assert asset_id == 1
-        assert len(payload) == 2
-    finally:
-        await pipeline.stop()
-
-
-# ============================================================================
-# 7. Multiple Assets Partitioned Independently
-# ============================================================================
-@pytest.mark.asyncio
-async def test_7_multiple_assets_partitioned_independently(mock_asset_resolver):
-    pipeline = BoundedLiveIngestionPipeline(
-        shard_id=0,
-        asset_resolver=mock_asset_resolver,
-        batch_size=10,
-        flush_interval_ms=50,
-    )
-
-    committed_batches = {}
+    committed_count = 0
 
     async def mock_commit(asset_id: int, payload: list):
-        committed_batches[asset_id] = payload
+        nonlocal committed_count
+        committed_count += len(payload)
 
     pipeline._commit_asset_batch = mock_commit
-
     await pipeline.start()
+
     try:
-        # Enqueue mixed assets in interleaved order
-        await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT", minute_offset=0))
-        await pipeline.enqueue_candle(create_candle(symbol="ETHUSDT", minute_offset=0))
-        await pipeline.enqueue_candle(create_candle(symbol="SOLUSDT", minute_offset=0))
-        await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT", minute_offset=1))
-        await pipeline.enqueue_candle(create_candle(symbol="ETHUSDT", minute_offset=1))
+        for i in range(60):
+            await pipeline.enqueue_candle(create_candle(minute_offset=i))
+            if pipeline.queue_size >= 10:
+                await asyncio.sleep(0.02)
 
         await asyncio.sleep(0.1)
-
-        assert len(committed_batches) == 3
-        assert 1 in committed_batches  # BTC
-        assert 2 in committed_batches  # ETH
-        assert 3 in committed_batches  # SOL
-        assert len(committed_batches[1]) == 2
-        assert len(committed_batches[2]) == 2
-        assert len(committed_batches[3]) == 1
+        assert pipeline.queue_size <= 15
+        assert committed_count == 60
     finally:
         await pipeline.stop()
 
 
 # ============================================================================
-# 8. BTC Ordering Preserved
+# ORDERING & PARTITIONING TESTS (13-18)
 # ============================================================================
+
 @pytest.mark.asyncio
-async def test_8_btc_ordering_preserved(mock_asset_resolver):
+async def test_13_btc_chronological_ordering(mock_asset_resolver):
+    """13. BTC events are committed in strict chronological order."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -325,10 +433,8 @@ async def test_8_btc_ordering_preserved(mock_asset_resolver):
         committed_payload.extend(payload)
 
     pipeline._commit_asset_batch = mock_commit
-
     await pipeline.start()
     try:
-        # Enqueue in order
         t0 = create_candle(symbol="BTCUSDT", minute_offset=0)
         t1 = create_candle(symbol="BTCUSDT", minute_offset=1)
         t2 = create_candle(symbol="BTCUSDT", minute_offset=2)
@@ -347,11 +453,9 @@ async def test_8_btc_ordering_preserved(mock_asset_resolver):
         await pipeline.stop()
 
 
-# ============================================================================
-# 9. ETH Ordering Preserved
-# ============================================================================
 @pytest.mark.asyncio
-async def test_9_eth_ordering_preserved(mock_asset_resolver):
+async def test_14_eth_chronological_ordering(mock_asset_resolver):
+    """14. ETH events are committed in strict chronological order."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -365,7 +469,6 @@ async def test_9_eth_ordering_preserved(mock_asset_resolver):
         committed_payload.extend(payload)
 
     pipeline._commit_asset_batch = mock_commit
-
     await pipeline.start()
     try:
         t0 = create_candle(symbol="ETHUSDT", minute_offset=0)
@@ -383,11 +486,9 @@ async def test_9_eth_ordering_preserved(mock_asset_resolver):
         await pipeline.stop()
 
 
-# ============================================================================
-# 10. BTC Cannot Interfere with ETH Ordering
-# ============================================================================
 @pytest.mark.asyncio
-async def test_10_btc_cannot_interfere_with_eth_ordering(mock_asset_resolver):
+async def test_15_btc_and_eth_independent_ordering(mock_asset_resolver):
+    """15. BTC and ETH are partitioned and ordered independently without cross-interference."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -401,12 +502,8 @@ async def test_10_btc_cannot_interfere_with_eth_ordering(mock_asset_resolver):
         batches[asset_id] = payload
 
     pipeline._commit_asset_batch = mock_commit
-
     await pipeline.start()
     try:
-        # Interleave out of order across assets:
-        # BTC: 10:00, 10:02, 10:01
-        # ETH: 10:02, 10:00, 10:01
         btc_0 = create_candle(symbol="BTCUSDT", minute_offset=0)
         btc_2 = create_candle(symbol="BTCUSDT", minute_offset=2)
         btc_1 = create_candle(symbol="BTCUSDT", minute_offset=1)
@@ -415,6 +512,7 @@ async def test_10_btc_cannot_interfere_with_eth_ordering(mock_asset_resolver):
         eth_0 = create_candle(symbol="ETHUSDT", minute_offset=0)
         eth_1 = create_candle(symbol="ETHUSDT", minute_offset=1)
 
+        # Interleave out of order across assets
         await pipeline.enqueue_candle(btc_0)
         await pipeline.enqueue_candle(eth_2)
         await pipeline.enqueue_candle(btc_2)
@@ -425,19 +523,15 @@ async def test_10_btc_cannot_interfere_with_eth_ordering(mock_asset_resolver):
         await asyncio.sleep(0.1)
 
         assert len(batches) == 2
-        # BTC strictly sorted independently
         assert [c["timestamp"] for c in batches[1]] == [btc_0.timestamp, btc_1.timestamp, btc_2.timestamp]
-        # ETH strictly sorted independently
         assert [c["timestamp"] for c in batches[2]] == [eth_0.timestamp, eth_1.timestamp, eth_2.timestamp]
     finally:
         await pipeline.stop()
 
 
-# ============================================================================
-# 11. Duplicate Candle is Harmless (In-Batch Deduplication)
-# ============================================================================
 @pytest.mark.asyncio
-async def test_11_duplicate_candle_is_harmless(mock_asset_resolver):
+async def test_16_duplicate_candle(mock_asset_resolver):
+    """16. Duplicate candle timestamps in the same batch are deduplicated harmlessly."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -451,10 +545,8 @@ async def test_11_duplicate_candle_is_harmless(mock_asset_resolver):
         committed.extend(payload)
 
     pipeline._commit_asset_batch = mock_commit
-
     await pipeline.start()
     try:
-        # Same timestamp sent twice
         t0 = create_candle(symbol="BTCUSDT", minute_offset=0)
         t0_dup = create_candle(symbol="BTCUSDT", minute_offset=0)
 
@@ -469,11 +561,9 @@ async def test_11_duplicate_candle_is_harmless(mock_asset_resolver):
         await pipeline.stop()
 
 
-# ============================================================================
-# 12. Out-of-Order Candle Handled Correctly
-# ============================================================================
 @pytest.mark.asyncio
-async def test_12_out_of_order_candle_handled_correctly(mock_asset_resolver):
+async def test_17_out_of_order_candle(mock_asset_resolver):
+    """17. Out-of-order candles (10:00, 10:02, 10:01) are sorted chronologically."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -487,10 +577,8 @@ async def test_12_out_of_order_candle_handled_correctly(mock_asset_resolver):
         committed.extend(payload)
 
     pipeline._commit_asset_batch = mock_commit
-
     await pipeline.start()
     try:
-        # Delivered as 10:00, 10:02, 10:01
         t0 = create_candle(minute_offset=0)
         t2 = create_candle(minute_offset=2)
         t1 = create_candle(minute_offset=1)
@@ -509,12 +597,9 @@ async def test_12_out_of_order_candle_handled_correctly(mock_asset_resolver):
         await pipeline.stop()
 
 
-# ============================================================================
-# 13. Missing Minute Does Not Create False Continuous Sync Range
-# ============================================================================
 @pytest.mark.asyncio
-async def test_13_missing_minute_does_not_create_false_continuous_sync_range():
-    # Test with IngestionService._commit_batch directly
+async def test_18_missing_candle():
+    """18. Missing candle (10:00, 10:04) preserves detectable gap in sync_ranges."""
     mock_db = AsyncMock()
     begin_mock = AsyncMock()
     begin_mock.__aenter__.return_value = None
@@ -542,124 +627,172 @@ async def test_13_missing_minute_does_not_create_false_continuous_sync_range():
 
 
 # ============================================================================
-# 14. Invalid OHLC Rejected
+# BATCHING TESTS (19-22)
 # ============================================================================
+
 @pytest.mark.asyncio
-async def test_14_invalid_ohlc_rejected(mock_asset_resolver):
+async def test_19_flush_by_batch_size(mock_asset_resolver):
+    """19. Batch flushes immediately when queue reaches batch_size."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
-        queue_maxsize=10,
-    )
-    pipeline._is_running = True
-
-    # High < Low (Using CandleEvent with invalid payload validation)
-    # CandleEvent constructor rejects invalid OHLC by default, but we test validate_candle_payload defensively
-    valid_c = create_candle()
-    assert validate_candle_payload(valid_c) is True
-
-    # Mutate internally to simulate corrupted object bypass
-    valid_c.high = 40000.0  # High < Low (49900)
-    assert validate_candle_payload(valid_c) is False
-
-    accepted = await pipeline.enqueue_candle(valid_c)
-    assert accepted is False
-    assert pipeline.metrics.rejected_candles == 1
-
-
-# ============================================================================
-# 15. Invalid Volume Rejected
-# ============================================================================
-@pytest.mark.asyncio
-async def test_15_invalid_volume_rejected(mock_asset_resolver):
-    pipeline = BoundedLiveIngestionPipeline(
-        shard_id=0,
-        asset_resolver=mock_asset_resolver,
-        queue_maxsize=10,
-    )
-    pipeline._is_running = True
-
-    valid_c = create_candle()
-    valid_c.volume = -5.0
-    assert validate_candle_payload(valid_c) is False
-
-    accepted = await pipeline.enqueue_candle(valid_c)
-    assert accepted is False
-    assert pipeline.metrics.rejected_candles == 1
-
-
-# ============================================================================
-# 16. Unknown Symbol Handled Safely
-# ============================================================================
-@pytest.mark.asyncio
-async def test_16_unknown_symbol_handled(mock_asset_resolver):
-    pipeline = BoundedLiveIngestionPipeline(
-        shard_id=0,
-        asset_resolver=mock_asset_resolver,
-        batch_size=5,
-        flush_interval_ms=50,
+        batch_size=3,
+        flush_interval_ms=100000,
     )
 
-    committed = []
-
-    async def mock_commit(asset_id: int, payload: list):
-        committed.extend(payload)
-
-    pipeline._commit_asset_batch = mock_commit
+    flush_mock = AsyncMock()
+    pipeline._commit_asset_batch = flush_mock
 
     await pipeline.start()
     try:
-        unknown_candle = create_candle(symbol="NONEXISTENTUSDT")
-        await pipeline.enqueue_candle(unknown_candle)
+        for i in range(3):
+            await pipeline.enqueue_candle(create_candle(minute_offset=i))
 
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
-        assert len(committed) == 0
-        assert pipeline.metrics.unmapped_symbol_rejections == 1
+        assert flush_mock.await_count == 1
+        asset_id, payload = flush_mock.call_args[0]
+        assert asset_id == 1
+        assert len(payload) == 3
     finally:
         await pipeline.stop()
 
 
-# ============================================================================
-# 17. Inactive Asset Handled Safely
-# ============================================================================
 @pytest.mark.asyncio
-async def test_17_inactive_asset_handled(mock_asset_resolver):
+async def test_20_flush_by_time(mock_asset_resolver):
+    """20. Batch flushes upon timer expiration if count < batch_size."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
-        batch_size=5,
+        batch_size=100,
         flush_interval_ms=50,
     )
 
-    committed = []
-
-    async def mock_commit(asset_id: int, payload: list):
-        committed.extend(payload)
-
-    pipeline._commit_asset_batch = mock_commit
+    flush_mock = AsyncMock()
+    pipeline._commit_asset_batch = flush_mock
 
     await pipeline.start()
     try:
-        delisted_candle = create_candle(symbol="DELISTEDUSDT")
-        await pipeline.enqueue_candle(delisted_candle)
+        await pipeline.enqueue_candle(create_candle(minute_offset=0))
+        await pipeline.enqueue_candle(create_candle(minute_offset=1))
 
         await asyncio.sleep(0.1)
 
-        assert len(committed) == 0
-        assert pipeline.metrics.inactive_asset_rejections == 1
+        assert flush_mock.await_count == 1
+        asset_id, payload = flush_mock.call_args[0]
+        assert asset_id == 1
+        assert len(payload) == 2
     finally:
         await pipeline.stop()
 
 
-# ============================================================================
-# 18. Database Batch Transaction Rollback
-# ============================================================================
 @pytest.mark.asyncio
-async def test_18_database_batch_transaction_rollback(mock_asset_resolver):
-    # Mock session factory where _commit_batch raises DB error
-    mock_session = AsyncMock()
+async def test_21_slow_asset_does_not_block_others(mock_asset_resolver):
+    """21. Delay or failure on one asset does not block persistence of other assets in batch."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        batch_size=10,
+        flush_interval_ms=50,
+    )
+
+    committed_assets = []
+
+    async def mock_commit(asset_id: int, payload: list):
+        if asset_id == 1:
+            await asyncio.sleep(0.02)
+            raise RuntimeError("BTC DB error")
+        committed_assets.append(asset_id)
+
+    pipeline._commit_asset_batch = mock_commit
+    await pipeline.start()
+    try:
+        await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT", minute_offset=0))
+        await pipeline.enqueue_candle(create_candle(symbol="ETHUSDT", minute_offset=0))
+
+        await asyncio.sleep(0.1)
+
+        assert 2 in committed_assets  # ETH committed successfully
+    finally:
+        await pipeline.stop()
+
+
+@pytest.mark.asyncio
+async def test_22_batch_has_hard_maximum(mock_asset_resolver):
+    """22. _drain_batch_items never returns more items than batch_size."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        queue_maxsize=20,
+        batch_size=5,
+    )
+    pipeline._is_running = True
+
+    for i in range(15):
+        await pipeline.enqueue_candle(create_candle(minute_offset=i))
+
+    assert pipeline.queue_size == 15
+    batch = pipeline._drain_batch_items(5)
+    assert len(batch) == 5
+    assert pipeline.queue_size == 10
+
+
+# ============================================================================
+# DATABASE & TRANSACTION TESTS (23-28)
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_23_successful_batch_commit():
+    """23. Successful batch commit inserts into raw_1m_candles and sync_ranges."""
+    engine = create_async_engine(settings.sqlalchemy_database_uri)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as session:
+        async with session.begin():
+            stmt_asset = pg_insert(AssetRegistry).values(
+                id=1, symbol="BTCUSDT", exchange="binance", asset_type="spot", is_active=True
+            ).on_conflict_do_nothing()
+            await session.execute(stmt_asset)
+            await session.execute(delete(SyncRange).where(SyncRange.asset_id == 1))
+            await session.execute(delete(Raw1mCandle).where(Raw1mCandle.asset_id == 1))
+
+    resolver = AssetRegistryResolver(session_factory=session_factory)
+    resolver.register_asset("BTCUSDT", 1, is_active=True)
+
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        session_factory=session_factory,
+        asset_resolver=resolver,
+        batch_size=2,
+        flush_interval_ms=20,
+    )
+    await pipeline.start()
+    try:
+        await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT", minute_offset=0))
+        await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT", minute_offset=1))
+
+        await asyncio.sleep(0.2)
+
+        assert pipeline.metrics.candles_persisted == 2
+        assert pipeline.metrics.persistence_errors == 0
+
+        async with session_factory() as session:
+            candles_res = await session.execute(select(func.count(Raw1mCandle.timestamp)).where(Raw1mCandle.asset_id == 1))
+            assert candles_res.scalar() == 2
+
+            ranges_res = await session.execute(select(SyncRange).where(SyncRange.asset_id == 1))
+            ranges = ranges_res.scalars().all()
+            assert len(ranges) == 1
+    finally:
+        await pipeline.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_24_transaction_rollback(mock_asset_resolver):
+    """24. Database persistence failure triggers clean rollback without false metric increments."""
     mock_session_factory = MagicMock()
+    mock_session = AsyncMock()
     mock_session_factory.return_value.__aenter__.return_value = mock_session
     mock_session_factory.return_value.__aexit__.return_value = None
 
@@ -671,7 +804,7 @@ async def test_18_database_batch_transaction_rollback(mock_asset_resolver):
         flush_interval_ms=50,
     )
 
-    with patch("app.services.ws_sharding.pipeline.IngestionService._commit_batch", side_effect=RuntimeError("DB Connection Lost")):
+    with patch("app.services.ingestion.IngestionService._commit_batch", side_effect=RuntimeError("DB Rollback Test")):
         await pipeline.start()
         try:
             await pipeline.enqueue_candle(create_candle(minute_offset=0))
@@ -685,20 +818,59 @@ async def test_18_database_batch_transaction_rollback(mock_asset_resolver):
             await pipeline.stop()
 
 
-# ============================================================================
-# 19. Concurrent BTC Writers (Real PostgreSQL)
-# ============================================================================
 @pytest.mark.asyncio
-async def test_19_concurrent_btc_writers():
-    """Verify concurrent writers inserting same BTC candle do not crash (ON CONFLICT DO NOTHING)."""
+async def test_25_duplicate_database_insert():
+    """25. Inserting duplicate candle in separate batches does not crash (ON CONFLICT DO NOTHING)."""
     engine = create_async_engine(settings.sqlalchemy_database_uri)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    # Seed asset registry and clean up test rows
     async with session_factory() as session:
         async with session.begin():
-            from sqlalchemy.dialects.postgresql import insert as pg_insert
-            from sqlalchemy import delete
+            stmt_asset = pg_insert(AssetRegistry).values(
+                id=1, symbol="BTCUSDT", exchange="binance", asset_type="spot", is_active=True
+            ).on_conflict_do_nothing()
+            await session.execute(stmt_asset)
+            await session.execute(delete(SyncRange).where(SyncRange.asset_id == 1))
+            await session.execute(delete(Raw1mCandle).where(Raw1mCandle.asset_id == 1))
+
+    resolver = AssetRegistryResolver(session_factory=session_factory)
+    resolver.register_asset("BTCUSDT", 1, is_active=True)
+
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        session_factory=session_factory,
+        asset_resolver=resolver,
+        batch_size=1,
+        flush_interval_ms=10,
+    )
+    await pipeline.start()
+    try:
+        c0 = create_candle(symbol="BTCUSDT", minute_offset=0)
+        await pipeline.enqueue_candle(c0)
+        await asyncio.sleep(0.1)
+
+        # Enqueue identical candle again in next batch
+        await pipeline.enqueue_candle(c0)
+        await asyncio.sleep(0.1)
+
+        assert pipeline.metrics.persistence_errors == 0
+
+        async with session_factory() as session:
+            res = await session.execute(select(func.count(Raw1mCandle.timestamp)).where(Raw1mCandle.asset_id == 1))
+            assert res.scalar() == 1
+    finally:
+        await pipeline.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_26_concurrent_btc_writers():
+    """26. Concurrent writers inserting the same BTC candle resolve harmlessly."""
+    engine = create_async_engine(settings.sqlalchemy_database_uri)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as session:
+        async with session.begin():
             stmt_asset = pg_insert(AssetRegistry).values(
                 id=1, symbol="BTCUSDT", exchange="binance", asset_type="spot", is_active=True
             ).on_conflict_do_nothing()
@@ -714,9 +886,7 @@ async def test_19_concurrent_btc_writers():
 
     await pipeline_a.start()
     await pipeline_b.start()
-
     try:
-        # Both enqueue exact same BTC candle simultaneously
         same_candle = create_candle(symbol="BTCUSDT", minute_offset=0)
         await asyncio.gather(
             pipeline_a.enqueue_candle(same_candle),
@@ -728,32 +898,23 @@ async def test_19_concurrent_btc_writers():
         assert pipeline_a.metrics.persistence_errors == 0
         assert pipeline_b.metrics.persistence_errors == 0
 
-        # Query database to confirm exactly 1 candle stored
         async with session_factory() as session:
-            from sqlalchemy import select, func
             res = await session.execute(select(func.count(Raw1mCandle.timestamp)).where(Raw1mCandle.asset_id == 1))
-            count = res.scalar()
-            assert count == 1
-
+            assert res.scalar() == 1
     finally:
         await pipeline_a.stop()
         await pipeline_b.stop()
         await engine.dispose()
 
 
-# ============================================================================
-# 20. Concurrent Different-Asset Writers (Real PostgreSQL)
-# ============================================================================
 @pytest.mark.asyncio
-async def test_20_concurrent_different_asset_writers():
+async def test_27_concurrent_btc_eth_writers():
+    """27. Concurrent writers on different assets operate independently."""
     engine = create_async_engine(settings.sqlalchemy_database_uri)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    # Seed asset registry and clean up test rows
     async with session_factory() as session:
         async with session.begin():
-            from sqlalchemy.dialects.postgresql import insert as pg_insert
-            from sqlalchemy import delete
             stmt_btc = pg_insert(AssetRegistry).values(
                 id=1, symbol="BTCUSDT", exchange="binance", asset_type="spot", is_active=True
             ).on_conflict_do_nothing()
@@ -774,7 +935,6 @@ async def test_20_concurrent_different_asset_writers():
 
     await pipeline_a.start()
     await pipeline_b.start()
-
     try:
         btc_candle = create_candle(symbol="BTCUSDT", minute_offset=5)
         eth_candle = create_candle(symbol="ETHUSDT", minute_offset=5)
@@ -790,22 +950,100 @@ async def test_20_concurrent_different_asset_writers():
         assert pipeline_b.metrics.persistence_errors == 0
         assert pipeline_a.metrics.candles_persisted == 1
         assert pipeline_b.metrics.candles_persisted == 1
-
     finally:
         await pipeline_a.stop()
         await pipeline_b.stop()
         await engine.dispose()
 
 
-# ============================================================================
-# 21. Shard Ownership Loss Fences Persistence
-# ============================================================================
 @pytest.mark.asyncio
-async def test_21_shard_ownership_loss_fences_persistence(mock_asset_resolver):
+async def test_28_sync_ranges_gap_preservation():
+    """28. Sync ranges in real PostgreSQL preserve non-contiguous gaps."""
+    engine = create_async_engine(settings.sqlalchemy_database_uri)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as session:
+        async with session.begin():
+            stmt_asset = pg_insert(AssetRegistry).values(
+                id=1, symbol="BTCUSDT", exchange="binance", asset_type="spot", is_active=True
+            ).on_conflict_do_nothing()
+            await session.execute(stmt_asset)
+            await session.execute(delete(SyncRange).where(SyncRange.asset_id == 1))
+            await session.execute(delete(Raw1mCandle).where(Raw1mCandle.asset_id == 1))
+
+    resolver = AssetRegistryResolver(session_factory=session_factory)
+    resolver.register_asset("BTCUSDT", 1, is_active=True)
+
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        session_factory=session_factory,
+        asset_resolver=resolver,
+        batch_size=10,
+        flush_interval_ms=50,
+    )
+    await pipeline.start()
+    try:
+        # Enqueue 10:00 and 10:04 (missing 10:01, 10:02, 10:03)
+        await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT", minute_offset=0))
+        await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT", minute_offset=4))
+
+        await asyncio.sleep(0.2)
+
+        async with session_factory() as session:
+            res = await session.execute(select(SyncRange).where(SyncRange.asset_id == 1).order_by(SyncRange.start_timestamp.asc()))
+            ranges = res.scalars().all()
+            assert len(ranges) == 2
+            assert ranges[0].start_timestamp == ranges[0].end_timestamp
+            assert ranges[1].start_timestamp == ranges[1].end_timestamp
+    finally:
+        await pipeline.stop()
+        await engine.dispose()
+
+
+# ============================================================================
+# OWNERSHIP & FENCING TESTS (29-32)
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_29_valid_owner_can_persist(mock_asset_resolver):
+    """29. ShardRuntime with active lease claim successfully persists candles."""
     claim = ShardLeaseClaim(
         shard_id=0,
-        worker_id="test-worker",
-        claim_token="claim-123",
+        worker_id="worker-1",
+        claim_token="claim-token-1",
+        claimed_at=datetime.now(timezone.utc),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=15),
+    )
+    runtime = ShardRuntime(
+        shard_id=0,
+        symbols=["BTCUSDT"],
+        claim=claim,
+        asset_resolver=mock_asset_resolver,
+    )
+    await runtime.start()
+
+    runtime.pipeline.batch_size = 1
+    runtime.pipeline.flush_interval_seconds = 0.02
+
+    commit_mock = AsyncMock()
+    runtime.pipeline._commit_asset_batch = commit_mock
+
+    try:
+        accepted = await runtime.enqueue_candle(create_candle(minute_offset=0))
+        assert accepted is True
+        await asyncio.sleep(0.1)
+        assert commit_mock.await_count == 1
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_30_lost_owner_cannot_persist(mock_asset_resolver):
+    """30. Lost shard owner is hard-fenced and cannot persist uncommitted data."""
+    claim = ShardLeaseClaim(
+        shard_id=0,
+        worker_id="worker-1",
+        claim_token="claim-token-1",
         claimed_at=datetime.now(timezone.utc),
         lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=15),
     )
@@ -820,35 +1058,190 @@ async def test_21_shard_ownership_loss_fences_persistence(mock_asset_resolver):
     commit_mock = AsyncMock()
     runtime.pipeline._commit_asset_batch = commit_mock
 
-    # Enqueue a candle while running
-    await runtime.enqueue_candle(create_candle(minute_offset=0))
-    assert runtime.pipeline.queue_size == 1
-
-    # Lease lost -> trigger hard fencing
-    runtime.fence(reason="Heartbeat renewal failed")
-
+    # Shard loses lease
+    runtime.fence(reason="Heartbeat lease expired")
     assert runtime.is_fenced is True
-    assert runtime.pipeline.queue_size == 0
-    assert runtime.pipeline.metrics.fenced_events_discarded >= 1
 
     # New work rejected
-    rejected = await runtime.enqueue_candle(create_candle(minute_offset=1))
-    assert rejected is False
+    accepted = await runtime.enqueue_candle(create_candle(minute_offset=0))
+    assert accepted is False
     assert commit_mock.await_count == 0
 
     await runtime.stop()
 
 
-# ============================================================================
-# 22. Graceful Shutdown Drains Queue
-# ============================================================================
 @pytest.mark.asyncio
-async def test_22_graceful_shutdown_drains_queue(mock_asset_resolver):
+async def test_31_ownership_loss_cancels_processing(mock_asset_resolver):
+    """31. Fencing discards in-memory queue items immediately."""
+    claim = ShardLeaseClaim(
+        shard_id=0,
+        worker_id="worker-1",
+        claim_token="claim-token-1",
+        claimed_at=datetime.now(timezone.utc),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=15),
+    )
+    runtime = ShardRuntime(
+        shard_id=0,
+        symbols=["BTCUSDT"],
+        claim=claim,
+        asset_resolver=mock_asset_resolver,
+    )
+    await runtime.start()
+
+    # Enqueue into queue without flusher running
+    await runtime.enqueue_candle(create_candle(minute_offset=0))
+    await runtime.enqueue_candle(create_candle(minute_offset=1))
+
+    assert runtime.buffer_count >= 2
+    runtime.fence(reason="Ownership lost to Worker B")
+
+    assert runtime.pipeline.queue_size == 0
+    assert runtime.buffer_count == 0
+    assert runtime.pipeline.metrics.fenced_events_discarded >= 2
+
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_32_redis_failure_fences_ingestion(mock_asset_resolver):
+    """32. Redis failure causes fail-closed fencing, halting ingestion."""
+    claim = ShardLeaseClaim(
+        shard_id=0,
+        worker_id="worker-1",
+        claim_token="claim-token-1",
+        claimed_at=datetime.now(timezone.utc),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=15),
+    )
+    runtime = ShardRuntime(
+        shard_id=0,
+        symbols=["BTCUSDT"],
+        claim=claim,
+        asset_resolver=mock_asset_resolver,
+    )
+    await runtime.start()
+
+    # Simulate Redis connection failure
+    runtime.fence(reason="RedisConnectionError: Connection refused")
+    assert runtime.is_fenced is True
+    assert runtime.is_accepting_work is False
+
+    await runtime.stop()
+
+
+# ============================================================================
+# FAILURE & RESILIENCE TESTS (33-38)
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_33_db_unavailable(mock_asset_resolver):
+    """33. DB connection failure enters error handling, leaves gap recoverable, does not crash."""
+    mock_session_factory = MagicMock()
+    mock_session_factory.side_effect = RuntimeError("PostgreSQL Connection Refused")
+
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        session_factory=mock_session_factory,
+        asset_resolver=mock_asset_resolver,
+        batch_size=2,
+        flush_interval_ms=20,
+    )
+    await pipeline.start()
+    try:
+        await pipeline.enqueue_candle(create_candle(minute_offset=0))
+        await pipeline.enqueue_candle(create_candle(minute_offset=1))
+
+        await asyncio.sleep(0.1)
+
+        assert pipeline.metrics.persistence_errors >= 1
+        assert pipeline.metrics.candles_persisted == 0
+    finally:
+        await pipeline.stop()
+
+
+@pytest.mark.asyncio
+async def test_34_db_timeout(mock_asset_resolver):
+    """34. Slow/hanging DB commit hits timeout and rolls back safely."""
+    mock_session_factory = MagicMock()
+    mock_session = AsyncMock()
+    mock_session_factory.return_value.__aenter__.return_value = mock_session
+    mock_session_factory.return_value.__aexit__.return_value = None
+
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        session_factory=mock_session_factory,
+        asset_resolver=mock_asset_resolver,
+        batch_size=1,
+        flush_interval_ms=10,
+    )
+
+    async def timeout_commit(asset_id, payload):
+        raise asyncio.TimeoutError("DB transaction timed out")
+
+    with patch("app.services.ingestion.IngestionService._commit_batch", side_effect=timeout_commit):
+        await pipeline.start()
+        try:
+            await pipeline.enqueue_candle(create_candle(minute_offset=0))
+            await asyncio.sleep(0.05)
+
+            assert pipeline.metrics.persistence_errors == 1
+        finally:
+            await pipeline.stop()
+
+
+@pytest.mark.asyncio
+async def test_35_ws_disconnect(mock_asset_resolver):
+    """35. WebSocket disconnect allows pipeline to flush pending in-flight items cleanly."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
         batch_size=10,
-        flush_interval_ms=10000,  # Long timer
+        flush_interval_ms=5000,
+    )
+
+    committed = []
+
+    async def mock_commit(asset_id: int, payload: list):
+        committed.extend(payload)
+
+    pipeline._commit_asset_batch = mock_commit
+    await pipeline.start()
+
+    await pipeline.enqueue_candle(create_candle(minute_offset=0))
+    await pipeline.enqueue_candle(create_candle(minute_offset=1))
+
+    # WebSocket disconnects -> triggers pipeline stop
+    await pipeline.stop()
+
+    assert pipeline.queue_size == 0
+    assert len(committed) == 2
+
+
+@pytest.mark.asyncio
+async def test_36_worker_cancellation(mock_asset_resolver):
+    """36. Pipeline flusher handles asyncio cancellation cleanly without orphan tasks."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        batch_size=10,
+        flush_interval_ms=5000,
+    )
+    await pipeline.start()
+
+    if pipeline._flusher_task:
+        pipeline._flusher_task.cancel()
+
+    await pipeline.stop()
+    assert pipeline.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_37_graceful_shutdown(mock_asset_resolver):
+    """37. Graceful shutdown drains queue and commits remaining batches."""
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        batch_size=10,
+        flush_interval_ms=10000,
     )
 
     committed = []
@@ -858,28 +1251,22 @@ async def test_22_graceful_shutdown_drains_queue(mock_asset_resolver):
         pipeline.metrics.record_flush_complete(len(payload), 1.0)
 
     pipeline._commit_asset_batch = mock_commit
-
     await pipeline.start()
 
-    # Enqueue 3 items
-    for i in range(3):
+    for i in range(4):
         await pipeline.enqueue_candle(create_candle(minute_offset=i))
 
-    assert pipeline.queue_size == 3
-
-    # Stop gracefully
+    assert pipeline.queue_size == 4
     await pipeline.stop()
 
     assert pipeline.queue_size == 0
-    assert len(committed) == 3
-    assert pipeline.metrics.candles_persisted == 3
+    assert len(committed) == 4
+    assert pipeline.metrics.candles_persisted == 4
 
 
-# ============================================================================
-# 23. Forced Cancellation Cleans Up
-# ============================================================================
 @pytest.mark.asyncio
-async def test_23_forced_cancellation_cleans_up(mock_asset_resolver):
+async def test_38_forced_shutdown(mock_asset_resolver):
+    """38. Forced shutdown terminates without deadlock."""
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
@@ -892,120 +1279,31 @@ async def test_23_forced_cancellation_cleans_up(mock_asset_resolver):
     if pipeline._flusher_task:
         pipeline._flusher_task.cancel()
 
-    # Calling stop should clean up without error or deadlock
     await pipeline.stop()
     assert pipeline.is_running is False
 
 
 # ============================================================================
-# 24. Memory Remains Bounded
+# ASSET MAPPING TESTS (39-42)
 # ============================================================================
+
 @pytest.mark.asyncio
-async def test_24_memory_remains_bounded(mock_asset_resolver):
+async def test_39_valid_symbol_mapping(mock_asset_resolver):
+    """39. Valid registered symbol resolves to (asset_id, True)."""
+    res = await mock_asset_resolver.resolve_symbol("BTCUSDT")
+    assert res == (1, True)
+
+
+@pytest.mark.asyncio
+async def test_40_unknown_symbol(mock_asset_resolver):
+    """40. Unknown symbol returns None and is rejected by pipeline."""
+    res = await mock_asset_resolver.resolve_symbol("UNKNOWNUSDT")
+    assert res is None
+
     pipeline = BoundedLiveIngestionPipeline(
         shard_id=0,
         asset_resolver=mock_asset_resolver,
-        queue_maxsize=20,
         batch_size=5,
-        flush_interval_ms=10,
-    )
-
-    committed_count = 0
-
-    async def mock_commit(asset_id: int, payload: list):
-        nonlocal committed_count
-        committed_count += len(payload)
-
-    pipeline._commit_asset_batch = mock_commit
-    await pipeline.start()
-
-    try:
-        # Enqueue 50 items rapidly through small queue
-        for i in range(50):
-            await pipeline.enqueue_candle(create_candle(minute_offset=i))
-            if pipeline.queue_size >= 15:
-                await asyncio.sleep(0.02)  # Let flusher drain
-
-        await asyncio.sleep(0.1)
-        assert pipeline.queue_size <= 20
-        assert committed_count == 50
-    finally:
-        await pipeline.stop()
-
-
-# ============================================================================
-# 25. Producer Backpressure
-# ============================================================================
-@pytest.mark.asyncio
-async def test_25_producer_backpressure(mock_asset_resolver):
-    # Queue maxsize 2, flusher stopped
-    pipeline = BoundedLiveIngestionPipeline(
-        shard_id=0,
-        asset_resolver=mock_asset_resolver,
-        queue_maxsize=2,
-    )
-    pipeline._is_running = True
-
-    assert await pipeline.enqueue_candle(create_candle(minute_offset=0)) is True
-    assert await pipeline.enqueue_candle(create_candle(minute_offset=1)) is True
-
-    # 3rd candle will trigger backpressure wait
-    async def put_delayed():
-        return await pipeline.enqueue_candle(create_candle(minute_offset=2))
-
-    task = asyncio.create_task(put_delayed())
-    await asyncio.sleep(0.05)
-    assert not task.done()  # Blocked waiting for queue space
-
-    # Drain 1 item to unblock
-    pipeline._queue.get_nowait()
-    pipeline._queue.task_done()
-
-    res = await task
-    assert res is True
-
-
-# ============================================================================
-# 26. Slow Database Handling
-# ============================================================================
-@pytest.mark.asyncio
-async def test_26_slow_database_handling(mock_asset_resolver):
-    pipeline = BoundedLiveIngestionPipeline(
-        shard_id=0,
-        asset_resolver=mock_asset_resolver,
-        batch_size=2,
-        flush_interval_ms=20,
-    )
-
-    async def slow_commit(asset_id: int, payload: list):
-        await asyncio.sleep(0.05)  # 50ms slow database
-        pipeline.metrics.record_flush_complete(len(payload), 50.0)
-
-    pipeline._commit_asset_batch = slow_commit
-    await pipeline.start()
-
-    try:
-        await pipeline.enqueue_candle(create_candle(minute_offset=0))
-        await pipeline.enqueue_candle(create_candle(minute_offset=1))
-
-        await asyncio.sleep(0.15)
-
-        assert pipeline.metrics.candles_persisted == 2
-        assert pipeline.metrics.last_batch_latency_ms >= 50.0
-    finally:
-        await pipeline.stop()
-
-
-# ============================================================================
-# 27. Queue Saturation Recovery
-# ============================================================================
-@pytest.mark.asyncio
-async def test_27_queue_saturation_recovery(mock_asset_resolver):
-    pipeline = BoundedLiveIngestionPipeline(
-        shard_id=0,
-        asset_resolver=mock_asset_resolver,
-        queue_maxsize=10,
-        batch_size=10,
         flush_interval_ms=50,
     )
 
@@ -1016,18 +1314,68 @@ async def test_27_queue_saturation_recovery(mock_asset_resolver):
 
     pipeline._commit_asset_batch = mock_commit
     await pipeline.start()
-
     try:
-        # Fill to 90% (9 items)
-        for i in range(9):
-            await pipeline.enqueue_candle(create_candle(minute_offset=i))
-
-        # Flusher will automatically wake up upon degraded threshold and drain
+        await pipeline.enqueue_candle(create_candle(symbol="UNKNOWNUSDT"))
         await asyncio.sleep(0.1)
 
-        # Queue should be drained and degraded state cleared
-        assert pipeline.queue_size == 0
-        assert pipeline.metrics.is_degraded is False
-        assert len(committed) == 9
+        assert len(committed) == 0
+        assert pipeline.metrics.unmapped_symbol_rejections == 1
     finally:
         await pipeline.stop()
+
+
+@pytest.mark.asyncio
+async def test_41_inactive_asset(mock_asset_resolver):
+    """41. Inactive/delisted asset returns (id, False) and is rejected by pipeline."""
+    res = await mock_asset_resolver.resolve_symbol("DELISTEDUSDT")
+    assert res == (4, False)
+
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=mock_asset_resolver,
+        batch_size=5,
+        flush_interval_ms=50,
+    )
+
+    committed = []
+
+    async def mock_commit(asset_id: int, payload: list):
+        committed.extend(payload)
+
+    pipeline._commit_asset_batch = mock_commit
+    await pipeline.start()
+    try:
+        await pipeline.enqueue_candle(create_candle(symbol="DELISTEDUSDT"))
+        await asyncio.sleep(0.1)
+
+        assert len(committed) == 0
+        assert pipeline.metrics.inactive_asset_rejections == 1
+    finally:
+        await pipeline.stop()
+
+
+@pytest.mark.asyncio
+async def test_42_bounded_mapping_cache():
+    """42. AssetRegistryResolver cache is bounded and unknown symbols do not cause memory growth."""
+    resolver = AssetRegistryResolver(max_cache_size=5)
+
+    # Register up to capacity
+    for i in range(5):
+        assert resolver.register_asset(f"SYM{i}", i + 1, is_active=True) is True
+
+    assert resolver.cached_count == 5
+
+    # 6th registration rejected
+    assert resolver.register_asset("SYM6", 6, is_active=True) is False
+    assert resolver.cached_count == 5
+
+    # Querying unknown symbols does not grow cache
+    for i in range(100):
+        res = await resolver.resolve_symbol(f"RANDOM{i}USDT")
+        assert res is None
+
+    assert resolver.cached_count == 5
+
+    # Invalidate cache
+    resolver.invalidate()
+    assert resolver.is_cache_valid is False

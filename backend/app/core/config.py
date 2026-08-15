@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     WS_REGISTRY_CACHE_TTL_SECONDS: float = 60.0
     WS_QUEUE_WARNING_THRESHOLD: float = 0.75
     WS_QUEUE_DEGRADED_THRESHOLD: float = 0.90
+    WS_MAX_PENDING_PER_ASSET: int = 2000
     
     # S3 / MinIO Settings for Historical Exports
     AWS_ACCESS_KEY_ID: str = "minioadmin"

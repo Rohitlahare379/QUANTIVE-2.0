@@ -21,6 +21,9 @@ from app.services.ws_sharding.assignment import normalize_symbol
 logger = logging.getLogger(__name__)
 
 
+MAX_REGISTRY_CACHE_SIZE = 10000
+
+
 class AssetRegistryResolver:
     """
     In-memory cached resolver for AssetRegistry records.
@@ -31,9 +34,11 @@ class AssetRegistryResolver:
         self,
         session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
         cache_ttl_seconds: Optional[float] = None,
+        max_cache_size: int = MAX_REGISTRY_CACHE_SIZE,
     ):
         self.session_factory = session_factory
         self.cache_ttl_seconds = cache_ttl_seconds or settings.WS_REGISTRY_CACHE_TTL_SECONDS
+        self.max_cache_size = max_cache_size
         self._cache: Dict[str, Tuple[int, bool]] = {}
         self._last_loaded_at: float = 0.0
         self._lock = asyncio.Lock()
@@ -50,15 +55,20 @@ class AssetRegistryResolver:
         """Returns the number of cached symbols."""
         return len(self._cache)
 
-    def register_asset(self, symbol: str, asset_id: int, is_active: bool = True) -> None:
+    def register_asset(self, symbol: str, asset_id: int, is_active: bool = True) -> bool:
         """
         Manually registers an asset mapping in cache.
         Useful for unit testing and deterministic verification.
+        Returns False if max_cache_size is reached.
         """
         clean_symbol = normalize_symbol(symbol)
+        if clean_symbol not in self._cache and len(self._cache) >= self.max_cache_size:
+            logger.warning(f"AssetRegistryResolver cache reached max size ({self.max_cache_size}).")
+            return False
         self._cache[clean_symbol] = (asset_id, is_active)
         if self._last_loaded_at == 0.0:
             self._last_loaded_at = time.time()
+        return True
 
     def invalidate(self) -> None:
         """Invalidates the cached mappings."""
@@ -87,6 +97,9 @@ class AssetRegistryResolver:
 
                 new_cache: Dict[str, Tuple[int, bool]] = {}
                 for asset_id, sym, is_active in rows:
+                    if len(new_cache) >= self.max_cache_size:
+                        logger.warning(f"Asset registry table exceeds cache capacity ({self.max_cache_size}). Truncating cache.")
+                        break
                     if sym:
                         new_cache[normalize_symbol(sym)] = (asset_id, bool(is_active))
 
