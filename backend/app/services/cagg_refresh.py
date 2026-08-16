@@ -3,7 +3,7 @@ import logging
 import traceback
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple, List
 from sqlalchemy import select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -210,3 +210,109 @@ class CaggRefreshService:
                 pass
 
         return True
+
+
+def compute_cagg_bucket_alignment(
+    start_time: datetime,
+    end_time: datetime,
+    timeframe: Optional[str] = None
+) -> Tuple[datetime, datetime]:
+    """
+    Aligns start_time and end_time to aggregate bucket boundaries.
+
+    Supported timeframes:
+    - '5m': 5-minute boundary
+    - '15m': 15-minute boundary
+    - '1h': 1-hour boundary
+    - '4h': 4-hour boundary (00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
+    - '1d': 1-day boundary (midnight UTC)
+    - None: union alignment covering all aggregate timeframes (1d boundary)
+    """
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=timezone.utc)
+    else:
+        start_time = start_time.astimezone(timezone.utc)
+
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+    else:
+        end_time = end_time.astimezone(timezone.utc)
+
+    if timeframe == "5m":
+        aligned_start = start_time.replace(
+            minute=(start_time.minute // 5) * 5, second=0, microsecond=0
+        )
+        end_aligned_base = end_time.replace(second=0, microsecond=0)
+        if end_time.minute % 5 == 0 and end_time.second == 0 and end_time.microsecond == 0:
+            aligned_end = end_aligned_base
+        else:
+            aligned_end = end_aligned_base.replace(
+                minute=(end_time.minute // 5) * 5
+            ) + timedelta(minutes=5)
+        return aligned_start, aligned_end
+
+    elif timeframe == "15m":
+        aligned_start = start_time.replace(
+            minute=(start_time.minute // 15) * 15, second=0, microsecond=0
+        )
+        end_aligned_base = end_time.replace(second=0, microsecond=0)
+        if end_time.minute % 15 == 0 and end_time.second == 0 and end_time.microsecond == 0:
+            aligned_end = end_aligned_base
+        else:
+            aligned_end = end_aligned_base.replace(
+                minute=(end_time.minute // 15) * 15
+            ) + timedelta(minutes=15)
+        return aligned_start, aligned_end
+
+    elif timeframe == "1h":
+        aligned_start = start_time.replace(minute=0, second=0, microsecond=0)
+        if end_time.minute == 0 and end_time.second == 0 and end_time.microsecond == 0:
+            aligned_end = end_time.replace(second=0, microsecond=0)
+        else:
+            aligned_end = end_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return aligned_start, aligned_end
+
+    elif timeframe == "4h":
+        aligned_start = start_time.replace(
+            hour=(start_time.hour // 4) * 4, minute=0, second=0, microsecond=0
+        )
+        if end_time.hour % 4 == 0 and end_time.minute == 0 and end_time.second == 0 and end_time.microsecond == 0:
+            aligned_end = end_time.replace(minute=0, second=0, microsecond=0)
+        else:
+            aligned_end = end_time.replace(
+                hour=(end_time.hour // 4) * 4, minute=0, second=0, microsecond=0
+            ) + timedelta(hours=4)
+        return aligned_start, aligned_end
+
+    elif timeframe == "1d":
+        aligned_start = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        if end_time.hour == 0 and end_time.minute == 0 and end_time.second == 0 and end_time.microsecond == 0:
+            aligned_end = end_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            aligned_end = end_time.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return aligned_start, aligned_end
+
+    else:
+        # Default: align to the day boundary to encompass all 5m, 15m, 1h, 4h, 1d continuous aggregates
+        return compute_cagg_bucket_alignment(start_time, end_time, timeframe="1d")
+
+
+async def schedule_cagg_refresh_job(
+    db: AsyncSession,
+    start_time: datetime,
+    end_time: datetime,
+    timeframe: Optional[str] = None
+) -> CaggRefreshJob:
+    """
+    Schedules a CaggRefreshJob for the aligned time window.
+    """
+    aligned_start, aligned_end = compute_cagg_bucket_alignment(start_time, end_time, timeframe=timeframe)
+    job = CaggRefreshJob(
+        window_start=aligned_start,
+        window_end=aligned_end,
+        status=RefreshStatus.PENDING
+    )
+    db.add(job)
+    await db.flush()
+    return job
+

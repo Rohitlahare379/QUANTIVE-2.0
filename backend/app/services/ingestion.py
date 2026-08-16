@@ -6,6 +6,7 @@ from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
+from app.models.asset_registry import AssetRegistry
 from app.models.sync_ranges import SyncRange
 from app.models.raw_1m_candles import Raw1mCandle
 from app.models.gap_staging_candles import GapStagingCandle
@@ -69,12 +70,17 @@ class IngestionService:
         """
         # We consider ranges "touching" if they are within 1 minute of each other.
         margin = timedelta(minutes=1)
+
+        # Acquire asset-level row lock to strictly serialize range merges per asset
+        await self.db.execute(
+            select(AssetRegistry.id).where(AssetRegistry.id == asset_id).with_for_update()
+        )
         
         stmt = select(SyncRange).where(
             SyncRange.asset_id == asset_id,
             SyncRange.start_timestamp <= new_end + margin,
             SyncRange.end_timestamp >= new_start - margin
-        )
+        ).with_for_update()
         result = await self.db.execute(stmt)
         overlaps = result.scalars().all()
 
@@ -172,6 +178,11 @@ class IngestionService:
 
         # 2. Guarantee atomicity using explicit transaction block
         async with self.db.begin():
+            # Lock asset row first to establish consistent lock ordering across concurrent commits
+            await self.db.execute(
+                select(AssetRegistry.id).where(AssetRegistry.id == asset_id).with_for_update()
+            )
+
             # Bulk inserts
             if live_candles:
                 await self.insert_candle_batch(live_candles, target_model=Raw1mCandle)

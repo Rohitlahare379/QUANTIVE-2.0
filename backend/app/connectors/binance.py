@@ -12,6 +12,7 @@ from app.connectors.exceptions import (
     APIError,
     RateLimitError,
     TemporaryBanError,
+    PayloadCorruptionError,
 )
 from app.connectors.rate_limiter import GlobalRateLimiter
 
@@ -129,21 +130,51 @@ class BinanceClient:
             
             if not klines:
                 break
+            
+            if not isinstance(klines, list):
+                raise PayloadCorruptionError(f"Expected klines list, got {type(klines).__name__}")
                 
             for kline in klines:
-                kline_time_ms = kline[0]
+                if not isinstance(kline, (list, tuple)) or len(kline) < 6:
+                    raise PayloadCorruptionError(f"Malformed kline element structure: {kline}")
                 
-                # Yield normalized candle
+                try:
+                    kline_time_ms = int(kline[0])
+                    open_price = float(kline[1])
+                    high_price = float(kline[2])
+                    low_price = float(kline[3])
+                    close_price = float(kline[4])
+                    volume = float(kline[5])
+                except (ValueError, TypeError) as e:
+                    raise PayloadCorruptionError(f"Invalid numeric data in kline {kline}: {e}") from e
+
+                # Financial OHLC Invariant Validations
+                if open_price <= 0 or high_price <= 0 or low_price <= 0 or close_price <= 0:
+                    raise PayloadCorruptionError(
+                        f"Price must be strictly positive (> 0): O={open_price}, H={high_price}, L={low_price}, C={close_price}"
+                    )
+                if volume < 0:
+                    raise PayloadCorruptionError(f"Volume cannot be negative: V={volume}")
+
+                eps = 1e-9
+                if high_price < (low_price - eps):
+                    raise PayloadCorruptionError(f"High price ({high_price}) < Low price ({low_price})")
+                if open_price < (low_price - eps) or open_price > (high_price + eps):
+                    raise PayloadCorruptionError(f"Open price ({open_price}) outside [low ({low_price}), high ({high_price})]")
+                if close_price < (low_price - eps) or close_price > (high_price + eps):
+                    raise PayloadCorruptionError(f"Close price ({close_price}) outside [low ({low_price}), high ({high_price})]")
+
+                # Yield normalized validated candle
                 yield {
                     "timestamp": datetime.fromtimestamp(kline_time_ms / 1000.0, tz=timezone.utc),
-                    "open": float(kline[1]),
-                    "high": float(kline[2]),
-                    "low": float(kline[3]),
-                    "close": float(kline[4]),
-                    "volume": float(kline[5])
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price,
+                    "volume": volume
                 }
             
-            last_kline_time_ms = klines[-1][0]
+            last_kline_time_ms = int(klines[-1][0])
             
             # If we received fewer items than the limit, we've hit the end of the available data
             if len(klines) < limit:
