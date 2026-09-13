@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -16,11 +18,24 @@ from app.api.routes.assets import router as assets_router
 from app.api.routes.candles import router as candles_router
 from app.api.routes.sync_status import router as sync_status_router
 from app.api.routes.exports import router as exports_router
+from app.db.session import engine
+from app.workers.config import close_async_redis_for_current_loop
+
+
+@asynccontextmanager
+async def application_lifespan(_: FastAPI):
+    """Release loop-bound pools during graceful API shutdown/reload."""
+    try:
+        yield
+    finally:
+        await close_async_redis_for_current_loop()
+        await engine.dispose()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Quantive Market Data API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=application_lifespan,
 )
 
 # Apply Rate Limiter

@@ -10,6 +10,7 @@ import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
 import logging
+import math
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -17,8 +18,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.connectors.models import CandleEvent
 from app.core.config import settings
-from app.services.ws_sharding.metrics import PipelineMetrics
-from app.services.ws_sharding.registry import AssetRegistryResolver
+from app.services.ws_sharding.metrics import (
+    PipelineMetrics,
+    publish_pipeline_metrics,
+    record_pipeline_outcome,
+)
+from app.services.ws_sharding.persistence_fence import ShardPersistenceFenceLostError
+from app.services.ws_sharding.registry import (
+    AssetRegistryResolver,
+    AssetRegistryUnavailableError,
+    BINANCE_EXCHANGE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +38,11 @@ def validate_candle_payload(event: CandleEvent) -> bool:
     Validates candle OHLCV invariants defensively before queueing/persistence.
     """
     if not event.is_closed:
+        return False
+
+    # This pipeline owns the canonical 1m table.  Accepting another interval
+    # would make a syntactically valid candle poison 1m coverage metadata.
+    if event.interval.strip().lower() != "1m":
         return False
 
     if (
@@ -50,6 +65,18 @@ def validate_candle_payload(event: CandleEvent) -> bool:
     if event.timestamp.tzinfo is None:
         return False
 
+    if event.timestamp.second != 0 or event.timestamp.microsecond != 0:
+        return False
+
+    if not all(
+        math.isfinite(value)
+        for value in (event.open, event.high, event.low, event.close, event.volume)
+    ):
+        return False
+
+    if event.close_time.tzinfo is None or event.close_time < event.timestamp:
+        return False
+
     return True
 
 
@@ -68,6 +95,8 @@ class BoundedLiveIngestionPipeline:
         flush_interval_ms: Optional[int] = None,
         max_pending_per_asset: Optional[int] = None,
         fencing_check: Optional[Callable[[], bool]] = None,
+        fatal_error_callback: Optional[Callable[[str], None]] = None,
+        persistence_fencer: Optional[Any] = None,
     ):
         self.shard_id = shard_id
         self.session_factory = session_factory
@@ -77,6 +106,11 @@ class BoundedLiveIngestionPipeline:
         self.flush_interval_seconds = float(flush_interval_ms or settings.WS_BATCH_FLUSH_INTERVAL_MS) / 1000.0
         self.max_pending_per_asset = max_pending_per_asset or settings.WS_MAX_PENDING_PER_ASSET
         self.fencing_check = fencing_check
+        self.fatal_error_callback = fatal_error_callback
+        # A database-backed ownership generation check.  It is optional only
+        # for isolated/offline tests; every production shard with a session
+        # factory receives one from the supervisor before runtime start.
+        self.persistence_fencer = persistence_fencer
 
         # Bounded asyncio Queue
         self._queue: asyncio.Queue[CandleEvent] = asyncio.Queue(maxsize=self.queue_maxsize)
@@ -109,22 +143,26 @@ class BoundedLiveIngestionPipeline:
         Returns True if successfully queued, False if rejected or dropped.
         """
         if not self._is_running:
+            record_pipeline_outcome(self.shard_id, "rejected_not_running")
             return False
 
         # 1. Defensive Validation
         if not validate_candle_payload(event):
             self.metrics.rejected_candles += 1
+            record_pipeline_outcome(self.shard_id, "rejected_validation")
             logger.debug(f"[Shard {self.shard_id}] Rejected invalid candle: {event}")
             return False
 
         # 2. Check Fencing
         if self.fencing_check and not self.fencing_check():
             self.metrics.fenced_events_discarded += 1
+            record_pipeline_outcome(self.shard_id, "discarded_fenced")
             return False
 
         # 3. Check Per-Asset Buffer Limit (Section 8)
         if self._pending_per_asset[event.symbol] >= self.max_pending_per_asset:
             self.metrics.asset_overflow_count += 1
+            record_pipeline_outcome(self.shard_id, "dropped_asset_backpressure")
             logger.warning(
                 f"[Shard {self.shard_id}] Asset {event.symbol} pending queue reached limit "
                 f"({self.max_pending_per_asset}). Rejecting new events until drained."
@@ -141,6 +179,7 @@ class BoundedLiveIngestionPipeline:
                 await asyncio.wait_for(self._queue.put(event), timeout=2.0)
             except (asyncio.TimeoutError, asyncio.QueueFull):
                 self.metrics.queue_overflow_count += 1
+                record_pipeline_outcome(self.shard_id, "dropped_queue_backpressure")
                 logger.warning(
                     f"[Shard {self.shard_id}] Queue full ({self.queue_maxsize}). Dropping event under backpressure.",
                     extra={"shard_id": self.shard_id, "event": "queue_overflow"}
@@ -169,6 +208,7 @@ class BoundedLiveIngestionPipeline:
         if self._is_running:
             return
         self._is_running = True
+        publish_pipeline_metrics(self.shard_id, self.metrics)
         self._flush_trigger_event.clear()
         self._flusher_task = asyncio.create_task(
             self._flusher_loop(),
@@ -176,8 +216,13 @@ class BoundedLiveIngestionPipeline:
         )
         logger.info(f"Started BoundedLiveIngestionPipeline for shard {self.shard_id}")
 
-    async def stop(self) -> None:
-        """Gracefully stops the pipeline and flushes remaining queue items."""
+    async def stop(self, flush: bool = True) -> None:
+        """Stop the pipeline, optionally flushing data owned by this runtime.
+
+        A normal shutdown flushes accepted events.  Lease fencing must pass
+        ``flush=False``: ownership has been lost, so retaining availability is less
+        important than preventing a stale worker from writing any further candles.
+        """
         if not self._is_running and self._flusher_task is None:
             return
 
@@ -196,13 +241,26 @@ class BoundedLiveIngestionPipeline:
                     pass
             self._flusher_task = None
 
-        # Clean drain if not fenced
-        if not (self.fencing_check and not self.fencing_check()):
+        if flush:
             await self.drain_and_flush()
         else:
             self.discard_uncommitted_buffers()
 
         logger.info(f"Stopped BoundedLiveIngestionPipeline for shard {self.shard_id}")
+        publish_pipeline_metrics(self.shard_id, self.metrics)
+
+    def fence(self) -> int:
+        """Synchronously fail closed and cancel future flush iterations.
+
+        This method is intentionally synchronous so a lease heartbeat can fence a
+        runtime immediately.  ``stop(flush=False)`` later awaits task cleanup and
+        WebSocket teardown.
+        """
+        self._is_running = False
+        self._flush_trigger_event.set()
+        if self._flusher_task and not self._flusher_task.done():
+            self._flusher_task.cancel()
+        return self.discard_uncommitted_buffers()
 
     def discard_uncommitted_buffers(self) -> int:
         """
@@ -221,6 +279,8 @@ class BoundedLiveIngestionPipeline:
         self._pending_per_asset.clear()
         self.metrics.fenced_events_discarded += count
         self.metrics.update_queue_stats(0, self.queue_maxsize)
+        publish_pipeline_metrics(self.shard_id, self.metrics)
+        record_pipeline_outcome(self.shard_id, "discarded_fenced", count)
         if count > 0:
             logger.warning(f"[Shard {self.shard_id}] Discarded {count} in-memory queue items due to fencing.")
         return count
@@ -277,6 +337,7 @@ class BoundedLiveIngestionPipeline:
             max_size=self.queue_maxsize,
             degraded_threshold=settings.WS_QUEUE_DEGRADED_THRESHOLD,
         )
+        publish_pipeline_metrics(self.shard_id, self.metrics)
         return batch
 
     async def drain_and_flush(self) -> int:
@@ -314,7 +375,26 @@ class BoundedLiveIngestionPipeline:
         # 2. Partition by Asset
         asset_groups: Dict[int, List[CandleEvent]] = defaultdict(list)
         for event in batch:
-            asset_info = await self.asset_resolver.resolve_symbol(event.symbol)
+            # Binance transport has no exchange field in each event; make its
+            # exchange identity explicit at the canonical routing boundary.
+            try:
+                asset_info = await self.asset_resolver.resolve_symbol(
+                    event.symbol, exchange=BINANCE_EXCHANGE
+                )
+            except AssetRegistryUnavailableError as exc:
+                # An expired registry that cannot be refreshed is a fatal
+                # attribution boundary, not a transient per-candle failure.
+                # Fence the owning runtime via its callback so it stops the
+                # source stream and cannot keep accepting data under stale
+                # symbol ownership.
+                self.metrics.persistence_errors += 1
+                message = f"asset registry unavailable: {exc}"
+                logger.error("[Shard %s] %s", self.shard_id, message)
+                if self.fatal_error_callback is not None:
+                    self.fatal_error_callback(message)
+                else:
+                    self.fence()
+                return
             if asset_info is None:
                 self.metrics.unmapped_symbol_rejections += 1
                 logger.debug(f"[Shard {self.shard_id}] Unknown symbol rejected: {event.symbol}")
@@ -365,6 +445,9 @@ class BoundedLiveIngestionPipeline:
                     "low": e.low,
                     "close": e.close,
                     "volume": e.volume,
+                    "source": e.source,
+                    "source_event_time": e.event_time,
+                    "source_received_at": e.received_at,
                 }
                 for e in deduped_events
             ]
@@ -374,6 +457,7 @@ class BoundedLiveIngestionPipeline:
                 await self._commit_asset_batch(asset_id, candles_payload)
             except Exception as e:
                 self.metrics.persistence_errors += 1
+                record_pipeline_outcome(self.shard_id, "persistence_error")
                 logger.error(
                     f"[Shard {self.shard_id}] Failed to commit {len(candles_payload)} candles for asset {asset_id}: {e}",
                     extra={"shard_id": self.shard_id, "asset_id": asset_id, "error": str(e), "event": "persistence_error"}
@@ -390,19 +474,53 @@ class BoundedLiveIngestionPipeline:
             # If running in mock/offline mode, record completion
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             self.metrics.record_flush_complete(len(candles_payload), latency_ms)
+            publish_pipeline_metrics(self.shard_id, self.metrics)
+            record_pipeline_outcome(self.shard_id, "persisted", len(candles_payload))
             return
 
         try:
             from app.services.ingestion import IngestionService
             async with self.session_factory() as session:
                 service = IngestionService(db_session=session)
-                await asyncio.wait_for(service._commit_batch(asset_id, candles_payload), timeout=10.0)
+                if self.persistence_fencer is None:
+                    await asyncio.wait_for(
+                        service._commit_batch(asset_id, candles_payload), timeout=10.0
+                    )
+                else:
+                    async def assert_persistence_ownership() -> None:
+                        await self.persistence_fencer.assert_current(session)
+
+                    await asyncio.wait_for(
+                        service._commit_batch(
+                            asset_id,
+                            candles_payload,
+                            ownership_check=assert_persistence_ownership,
+                        ),
+                        timeout=10.0,
+                    )
 
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             self.metrics.record_flush_complete(len(candles_payload), latency_ms)
+            publish_pipeline_metrics(self.shard_id, self.metrics)
+            record_pipeline_outcome(self.shard_id, "persisted", len(candles_payload))
 
+        except ShardPersistenceFenceLostError as e:
+            self.metrics.persistence_errors += 1
+            record_pipeline_outcome(self.shard_id, "persistence_fence_lost")
+            message = f"persistence ownership lost: {e}"
+            logger.error(
+                "[Shard %s] %s",
+                self.shard_id,
+                message,
+                extra={"shard_id": self.shard_id, "event": "persistence_fence_lost"},
+            )
+            if self.fatal_error_callback is not None:
+                self.fatal_error_callback(message)
+            else:
+                self.fence()
         except Exception as e:
             self.metrics.persistence_errors += 1
+            record_pipeline_outcome(self.shard_id, "persistence_error")
             logger.error(
                 f"[Shard {self.shard_id}] Failed to commit {len(candles_payload)} candles for asset {asset_id}: {e}",
                 extra={"shard_id": self.shard_id, "asset_id": asset_id, "error": str(e), "event": "persistence_error"}

@@ -17,8 +17,13 @@ Algorithm:
 """
 
 import hashlib
+from math import ceil
 from typing import Dict, Iterable, List, Optional
 from app.core.config import settings
+
+
+class ShardCapacityError(ValueError):
+    """The configured shard set cannot host the canonical stream universe."""
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -66,9 +71,38 @@ def get_shard_for_symbol(symbol: str, num_shards: Optional[int] = None) -> int:
     return hash_int % num_shards
 
 
+def required_shard_count(
+    symbols: Iterable[str],
+    *,
+    max_streams_per_shard: Optional[int] = None,
+    minimum_shards: Optional[int] = None,
+) -> int:
+    """Return the capacity-safe number of shards for unique normalized symbols."""
+    capacity = max_streams_per_shard or settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION
+    if capacity <= 0:
+        raise ValueError("max_streams_per_shard must be positive")
+    minimum = settings.WS_NUM_SHARDS if minimum_shards is None else minimum_shards
+    if minimum <= 0:
+        raise ValueError("minimum_shards must be positive")
+    unique_symbols = {normalize_symbol(symbol) for symbol in symbols}
+    return max(minimum, ceil(len(unique_symbols) / capacity))
+
+
+def _fallback_shards(symbol: str, num_shards: int) -> list[int]:
+    """Stable fallback order used only after the symbol's home shard is full."""
+    home = get_shard_for_symbol(symbol, num_shards)
+    alternatives = [shard for shard in range(num_shards) if shard != home]
+    alternatives.sort(
+        key=lambda shard: hashlib.sha256(f"{symbol}:{shard}".encode("utf-8")).digest()
+    )
+    return [home, *alternatives]
+
+
 def assign_symbols_to_shards(
     symbols: Iterable[str],
-    num_shards: Optional[int] = None
+    num_shards: Optional[int] = None,
+    *,
+    max_streams_per_shard: Optional[int] = None,
 ) -> Dict[int, List[str]]:
     """
     Partitions a collection of symbols into a dictionary mapping shard_id to a sorted list of symbols.
@@ -86,19 +120,36 @@ def assign_symbols_to_shards(
     if num_shards <= 0:
         raise ValueError(f"num_shards must be a positive integer, got {num_shards}")
 
-    buckets: Dict[int, set] = {i: set() for i in range(num_shards)}
-    for sym in symbols:
-        clean = normalize_symbol(sym)
-        shard_id = get_shard_for_symbol(clean, num_shards)
-        buckets[shard_id].add(clean)
+    capacity = max_streams_per_shard or settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION
+    if capacity <= 0:
+        raise ValueError("max_streams_per_shard must be positive")
 
-    return {shard_id: sorted(list(sym_set)) for shard_id, sym_set in buckets.items()}
+    normalized_symbols = sorted({normalize_symbol(sym) for sym in symbols})
+    required = ceil(len(normalized_symbols) / capacity) if normalized_symbols else 0
+    if required > num_shards:
+        raise ShardCapacityError(
+            f"{len(normalized_symbols)} streams require at least {required} shards at "
+            f"{capacity} streams per shard; only {num_shards} configured"
+        )
+
+    buckets: Dict[int, list[str]] = {i: [] for i in range(num_shards)}
+    for clean in normalized_symbols:
+        for shard_id in _fallback_shards(clean, num_shards):
+            if len(buckets[shard_id]) < capacity:
+                buckets[shard_id].append(clean)
+                break
+        else:  # Defensive: the capacity preflight above should make this unreachable.
+            raise ShardCapacityError("No shard capacity remains for stream assignment")
+
+    return {shard_id: sorted(symbols_for_shard) for shard_id, symbols_for_shard in buckets.items()}
 
 
 def get_symbols_for_shard(
     symbols: Iterable[str],
     shard_id: int,
-    num_shards: Optional[int] = None
+    num_shards: Optional[int] = None,
+    *,
+    max_streams_per_shard: Optional[int] = None,
 ) -> List[str]:
     """
     Filters and returns only the normalized symbols assigned to the specified shard_id.
@@ -120,10 +171,9 @@ def get_symbols_for_shard(
     if shard_id < 0 or shard_id >= num_shards:
         raise ValueError(f"shard_id {shard_id} is out of valid range [0, {num_shards - 1}]")
 
-    result = set()
-    for sym in symbols:
-        clean = normalize_symbol(sym)
-        if get_shard_for_symbol(clean, num_shards) == shard_id:
-            result.add(clean)
-
-    return sorted(list(result))
+    assignment = assign_symbols_to_shards(
+        symbols,
+        num_shards,
+        max_streams_per_shard=max_streams_per_shard,
+    )
+    return assignment[shard_id]

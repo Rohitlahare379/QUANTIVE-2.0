@@ -79,6 +79,7 @@ from app.models.raw_1m_candles import Raw1mCandle
 from app.models.sync_ranges import SyncRange
 from app.services.ingestion import IngestionService
 from app.services.ws_sharding.lease import ShardLeaseClaim
+from app.services.ws_sharding.persistence_fence import ShardPersistenceFenceLostError
 from app.services.ws_sharding.pipeline import (
     BoundedLiveIngestionPipeline,
     validate_candle_payload,
@@ -99,7 +100,10 @@ def create_candle(
     base_time: Optional[datetime] = None,
 ) -> CandleEvent:
     """Helper to create valid synthetic CandleEvents."""
-    base = base_time or datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+    # WebSocket events are live data.  Keep the default inside the canonical
+    # live-ingestion window so this real PostgreSQL test exercises raw
+    # persistence rather than intentionally historical staging behavior.
+    base = base_time or datetime.now(timezone.utc).replace(second=0, microsecond=0)
     ts = base + timedelta(minutes=minute_offset)
     close_ts = ts + timedelta(seconds=59, milliseconds=999)
     return CandleEvent(
@@ -254,6 +258,26 @@ async def test_05_utc_timestamp_preserved(mock_asset_resolver):
     assert utc_c.timestamp.tzinfo == timezone.utc
     assert validate_candle_payload(utc_c) is True
     assert await pipeline.enqueue_candle(utc_c) is True
+
+
+@pytest.mark.asyncio
+async def test_raw_1m_pipeline_rejects_wrong_interval_nonminute_and_nonfinite_values(mock_asset_resolver):
+    """Valid-looking transport messages cannot poison canonical 1m coverage."""
+    pipeline = BoundedLiveIngestionPipeline(shard_id=0, asset_resolver=mock_asset_resolver)
+    pipeline._is_running = True
+
+    wrong_interval = create_candle()
+    wrong_interval.interval = "5m"
+    nonminute = create_candle()
+    nonminute.timestamp = nonminute.timestamp + timedelta(seconds=1)
+    nonfinite = create_candle()
+    nonfinite.close = float("nan")
+
+    for event in (wrong_interval, nonminute, nonfinite):
+        assert validate_candle_payload(event) is False
+        assert await pipeline.enqueue_candle(event) is False
+
+    assert pipeline.metrics.rejected_candles == 3
 
 
 # ============================================================================
@@ -608,8 +632,8 @@ async def test_18_missing_candle():
 
     service = IngestionService(db_session=mock_db)
 
-    t0 = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
-    t4 = datetime(2026, 8, 15, 10, 4, tzinfo=timezone.utc)
+    t0 = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    t4 = t0 + timedelta(minutes=4)
 
     candles = [
         {"asset_id": 1, "timestamp": t0, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 10.0},
@@ -617,13 +641,14 @@ async def test_18_missing_candle():
     ]
 
     with patch.object(service, "insert_candle_batch", new_callable=AsyncMock) as mock_insert:
-        with patch.object(service, "update_sync_ranges", new_callable=AsyncMock) as mock_update:
-            await service._commit_batch(1, candles)
+        with patch.object(service, "_raw_block_is_complete", new_callable=AsyncMock, return_value=True):
+            with patch.object(service, "_merge_verified_sync_ranges", new_callable=AsyncMock) as mock_update:
+                await service._commit_batch(1, candles)
 
-            # Must update sync_ranges TWICE (separate blocks [t0, t0] and [t4, t4]), NEVER [t0, t4]
-            assert mock_update.call_count == 2
-            mock_update.assert_any_call(1, t0, t0)
-            mock_update.assert_any_call(1, t4, t4)
+                # Must update sync_ranges TWICE (separate blocks [t0, t0] and [t4, t4]), NEVER [t0, t4]
+                assert mock_update.call_count == 2
+                mock_update.assert_any_call(1, t0, t0)
+                mock_update.assert_any_call(1, t4, t4)
 
 
 # ============================================================================
@@ -742,6 +767,8 @@ async def test_22_batch_has_hard_maximum(mock_asset_resolver):
 # ============================================================================
 
 @pytest.mark.asyncio
+@pytest.mark.postgres
+@pytest.mark.timescaledb
 async def test_23_successful_batch_commit():
     """23. Successful batch commit inserts into raw_1m_candles and sync_ranges."""
     engine = create_async_engine(settings.sqlalchemy_database_uri)
@@ -819,6 +846,8 @@ async def test_24_transaction_rollback(mock_asset_resolver):
 
 
 @pytest.mark.asyncio
+@pytest.mark.postgres
+@pytest.mark.timescaledb
 async def test_25_duplicate_database_insert():
     """25. Inserting duplicate candle in separate batches does not crash (ON CONFLICT DO NOTHING)."""
     engine = create_async_engine(settings.sqlalchemy_database_uri)
@@ -864,6 +893,8 @@ async def test_25_duplicate_database_insert():
 
 
 @pytest.mark.asyncio
+@pytest.mark.postgres
+@pytest.mark.timescaledb
 async def test_26_concurrent_btc_writers():
     """26. Concurrent writers inserting the same BTC candle resolve harmlessly."""
     engine = create_async_engine(settings.sqlalchemy_database_uri)
@@ -908,6 +939,8 @@ async def test_26_concurrent_btc_writers():
 
 
 @pytest.mark.asyncio
+@pytest.mark.postgres
+@pytest.mark.timescaledb
 async def test_27_concurrent_btc_eth_writers():
     """27. Concurrent writers on different assets operate independently."""
     engine = create_async_engine(settings.sqlalchemy_database_uri)
@@ -957,6 +990,8 @@ async def test_27_concurrent_btc_eth_writers():
 
 
 @pytest.mark.asyncio
+@pytest.mark.postgres
+@pytest.mark.timescaledb
 async def test_28_sync_ranges_gap_preservation():
     """28. Sync ranges in real PostgreSQL preserve non-contiguous gaps."""
     engine = create_async_engine(settings.sqlalchemy_database_uri)
@@ -1379,3 +1414,71 @@ async def test_42_bounded_mapping_cache():
     # Invalidate cache
     resolver.invalidate()
     assert resolver.is_cache_valid is False
+
+
+@pytest.mark.asyncio
+async def test_exchange_scoped_asset_resolution_cannot_map_binance_event_to_same_symbol_elsewhere():
+    """A symbol collision across exchanges must not corrupt Binance attribution."""
+    resolver = AssetRegistryResolver()
+    assert resolver.register_asset("BTCUSDT", 1, exchange="BINANCE") is True
+    assert resolver.register_asset("BTCUSDT", 2, exchange="COINBASE") is True
+
+    assert await resolver.resolve_symbol("BTCUSDT") == (1, True)
+    assert await resolver.resolve_symbol("BTCUSDT", exchange="COINBASE") == (2, True)
+
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=0,
+        asset_resolver=resolver,
+        batch_size=1,
+        flush_interval_ms=100000,
+    )
+    committed = []
+
+    async def capture(asset_id: int, payload: list):
+        committed.append((asset_id, payload))
+
+    pipeline._commit_asset_batch = capture
+    await pipeline.start()
+    try:
+        assert await pipeline.enqueue_candle(create_candle(symbol="BTCUSDT")) is True
+        await pipeline.drain_and_flush()
+    finally:
+        await pipeline.stop()
+
+    assert [asset_id for asset_id, _ in committed] == [1]
+
+
+@pytest.mark.asyncio
+async def test_lost_database_persistence_fence_fences_pipeline_before_a_stale_write(monkeypatch, mock_asset_resolver):
+    """A newer shard generation turns a stale queued batch into a hard fence, not a write."""
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class LosingPersistenceFencer:
+        async def assert_current(self, session):
+            raise ShardPersistenceFenceLostError("successor is registered")
+
+    async def fenced_commit(self, asset_id, candles_payload, *, ownership_check=None):
+        assert ownership_check is not None
+        await ownership_check()
+        pytest.fail("a stale shard must not reach candle persistence")
+
+    monkeypatch.setattr(IngestionService, "_commit_batch", fenced_commit)
+    fatal_reasons = []
+    pipeline = BoundedLiveIngestionPipeline(
+        shard_id=17,
+        session_factory=lambda: SessionContext(),
+        asset_resolver=mock_asset_resolver,
+        persistence_fencer=LosingPersistenceFencer(),
+        fatal_error_callback=fatal_reasons.append,
+    )
+
+    await pipeline._commit_asset_batch(1, [{"asset_id": 1}])
+
+    assert pipeline.metrics.persistence_errors == 1
+    assert fatal_reasons and "persistence ownership lost" in fatal_reasons[0]

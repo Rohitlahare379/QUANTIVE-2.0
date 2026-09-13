@@ -145,6 +145,7 @@ class BinanceClient:
                     low_price = float(kline[3])
                     close_price = float(kline[4])
                     volume = float(kline[5])
+                    close_time_ms = int(kline[6]) if len(kline) > 6 and kline[6] is not None else None
                 except (ValueError, TypeError) as e:
                     raise PayloadCorruptionError(f"Invalid numeric data in kline {kline}: {e}") from e
 
@@ -171,7 +172,17 @@ class BinanceClient:
                     "high": high_price,
                     "low": low_price,
                     "close": close_price,
-                    "volume": volume
+                    "volume": volume,
+                    # REST is a reconciliation source, not the primary live feed.
+                    # Persisting its provenance allows a materially different
+                    # finalized response to become an auditable correction.
+                    "source": "binance_rest",
+                    "source_event_time": (
+                        datetime.fromtimestamp(close_time_ms / 1000.0, tz=timezone.utc)
+                        if close_time_ms is not None
+                        else None
+                    ),
+                    "source_received_at": datetime.now(timezone.utc),
                 }
             
             last_kline_time_ms = int(klines[-1][0])

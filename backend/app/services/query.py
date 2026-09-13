@@ -35,10 +35,10 @@ class AssetQueryService:
     def __init__(self, db: AsyncSession):
         self.repo = AssetRepository(db)
 
-    async def get_asset_by_symbol(self, symbol: str) -> Dict[str, Any]:
-        asset = await self.repo.get_by_symbol(symbol)
+    async def get_asset_by_symbol(self, symbol: str, exchange: str = "BINANCE") -> Dict[str, Any]:
+        asset = await self.repo.get_by_symbol(symbol, exchange=exchange)
         if not asset:
-            raise AssetNotFoundError(f"Asset with symbol {symbol} not found")
+            raise AssetNotFoundError(f"Asset with symbol {symbol} on exchange {exchange} not found")
         return {
             "id": asset.id,
             "symbol": asset.symbol,
@@ -47,8 +47,22 @@ class AssetQueryService:
             "is_active": asset.is_active
         }
 
-    async def list_assets(self) -> List[Dict[str, Any]]:
-        assets = await self.repo.list_assets()
+    async def list_assets(
+        self,
+        *,
+        exchange: str | None = None,
+        asset_type: str | None = None,
+        active_only: bool = True,
+        limit: int,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        assets = await self.repo.list_assets(
+            exchange=exchange,
+            asset_type=asset_type,
+            active_only=active_only,
+            limit=limit,
+            offset=offset,
+        )
         return [
             {
                 "id": asset.id,

@@ -43,6 +43,23 @@ async def test_get_asset_by_symbol(mock_db, mock_asset_repo):
     
     assert result["id"] == 1
     assert result["symbol"] == "BTCUSDT"
+    mock_asset_repo.get_by_symbol.assert_awaited_once_with("BTCUSDT", exchange="BINANCE")
+
+
+@pytest.mark.asyncio
+async def test_get_asset_by_symbol_preserves_exchange_identity(mock_db, mock_asset_repo):
+    mock_asset = AsyncMock()
+    mock_asset.id = 2
+    mock_asset.symbol = "BTCUSDT"
+    mock_asset.exchange = "COINBASE"
+    mock_asset.asset_type = "SPOT"
+    mock_asset.is_active = True
+    mock_asset_repo.get_by_symbol.return_value = mock_asset
+
+    result = await AssetQueryService(mock_db).get_asset_by_symbol("BTCUSDT", exchange="COINBASE")
+
+    assert result["id"] == 2
+    mock_asset_repo.get_by_symbol.assert_awaited_once_with("BTCUSDT", exchange="COINBASE")
 
 @pytest.mark.asyncio
 async def test_get_asset_not_found(mock_db, mock_asset_repo):
@@ -51,6 +68,25 @@ async def test_get_asset_not_found(mock_db, mock_asset_repo):
     
     with pytest.raises(AssetNotFoundError):
         await service.get_asset_by_symbol("INVALID")
+
+
+@pytest.mark.asyncio
+async def test_list_assets_passes_filters_and_pagination_to_repository(mock_db, mock_asset_repo):
+    asset = MagicMock(id=1, symbol="BTCUSDT", exchange="BINANCE", asset_type="SPOT", is_active=True)
+    mock_asset_repo.list_assets.return_value = [asset]
+
+    result = await AssetQueryService(mock_db).list_assets(
+        exchange="BINANCE",
+        asset_type="SPOT",
+        active_only=True,
+        limit=25,
+        offset=50,
+    )
+
+    assert result == [{"id": 1, "symbol": "BTCUSDT", "exchange": "BINANCE", "asset_type": "SPOT", "is_active": True}]
+    mock_asset_repo.list_assets.assert_awaited_once_with(
+        exchange="BINANCE", asset_type="SPOT", active_only=True, limit=25, offset=50
+    )
 
 @pytest.mark.asyncio
 async def test_timeframe_routing_invalid(mock_db):

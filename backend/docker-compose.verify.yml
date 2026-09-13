@@ -1,0 +1,93 @@
+# Isolated, disposable verification stack.  Run with a distinct project name:
+#
+# VERIFY_POSTGRES_PASSWORD=... VERIFY_REDIS_PASSWORD=... \
+# docker compose -p quantive-verify -f docker-compose.verify.yml up \
+#   --build --abort-on-container-exit --exit-code-from verify
+#
+# It never mounts or reuses the deployment Compose volumes.  The verify service
+# migrates its fresh TimescaleDB instance to Alembic head, checks API readiness,
+# runs workers, and executes every local infrastructure-marked test.
+services:
+  db:
+    image: timescale/timescaledb:2.17.2-pg16
+    environment:
+      POSTGRES_USER: quantive_verify
+      POSTGRES_PASSWORD: ${VERIFY_POSTGRES_PASSWORD:?VERIFY_POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: quantive_verify
+    volumes:
+      - verify_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantive_verify -d quantive_verify"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${VERIFY_REDIS_PASSWORD:?VERIFY_REDIS_PASSWORD must be set}"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${VERIFY_REDIS_PASSWORD}\" ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    environment: &verify_environment
+      ENVIRONMENT: test
+      POSTGRES_SERVER: db
+      POSTGRES_USER: quantive_verify
+      POSTGRES_PASSWORD: ${VERIFY_POSTGRES_PASSWORD:?VERIFY_POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: quantive_verify
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://:${VERIFY_REDIS_PASSWORD:?VERIFY_REDIS_PASSWORD must be set}@redis:6379/0
+      API_KEY_PEPPER: quantive-verification-only
+      AWS_ACCESS_KEY_ID: verification
+      AWS_SECRET_ACCESS_KEY: verification
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+
+  api:
+    build: .
+    environment: *verify_environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3).read()"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build: .
+    environment: *verify_environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: dramatiq app.workers.tasks app.workers.gap_repair app.workers.cagg_refresh app.workers.historical_merge --processes 1 --threads 1
+
+  verify:
+    build: .
+    environment: *verify_environment
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    command:
+      [
+        "sh",
+        "-ec",
+        "alembic current && python -c \"import urllib.request; urllib.request.urlopen('http://api:8000/ready', timeout=3).read()\" && pytest -v -m 'not external_binance' --tb=short",
+      ]
+
+volumes:
+  verify_db_data:

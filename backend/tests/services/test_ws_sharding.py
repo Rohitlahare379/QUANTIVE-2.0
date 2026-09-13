@@ -24,12 +24,16 @@ from datetime import datetime, timezone, timedelta
 import fakeredis.aioredis
 import pytest
 import pytest_asyncio
+from unittest.mock import MagicMock
+from prometheus_client import generate_latest
 
 from app.services.ws_sharding.assignment import (
+    ShardCapacityError,
     assign_symbols_to_shards,
     get_shard_for_symbol,
     get_symbols_for_shard,
     normalize_symbol,
+    required_shard_count,
 )
 from app.services.ws_sharding.lease import (
     RedisUnavailableError,
@@ -39,6 +43,7 @@ from app.services.ws_sharding.lease import (
 )
 from app.services.ws_sharding.runtime import ShardRuntime, ShardRuntimeState
 from app.services.ws_sharding.supervisor import ShardSupervisor
+from app.services.ws_sharding.metrics import PipelineMetrics, publish_pipeline_metrics, record_pipeline_outcome
 
 
 @pytest_asyncio.fixture
@@ -103,6 +108,57 @@ def test_3_different_symbols_distribute_reasonably():
         assert filtered == distribution[shard_id]
 
 
+def test_capacity_aware_assignment_never_exceeds_configured_connection_limit():
+    """Overflow must be deterministically spread rather than sent to Binance."""
+    symbols = [f"CAPACITY{i:04d}USDT" for i in range(1_025)]
+
+    assert required_shard_count(symbols, max_streams_per_shard=1_024, minimum_shards=1) == 2
+    with pytest.raises(ShardCapacityError, match="require at least 2 shards"):
+        assign_symbols_to_shards(symbols, num_shards=1, max_streams_per_shard=1_024)
+
+    assignment = assign_symbols_to_shards(symbols, num_shards=2, max_streams_per_shard=1_024)
+    repeated = assign_symbols_to_shards(reversed(symbols), num_shards=2, max_streams_per_shard=1_024)
+    assert assignment == repeated
+    assert sum(map(len, assignment.values())) == len(symbols)
+    assert all(len(streams) <= 1_024 for streams in assignment.values())
+
+
+def test_supervisor_rejects_a_topology_without_shared_capacity():
+    symbols = [f"SUPERVISOR{i:04d}USDT" for i in range(1_025)]
+    with pytest.raises(ShardCapacityError, match="require at least 2 shared shards"):
+        ShardSupervisor(
+            worker_id="capacity-test",
+            num_shards=1,
+            symbols=symbols,
+            lease_manager=MagicMock(),
+        )
+
+    supervisor = ShardSupervisor(
+        worker_id="capacity-test",
+        num_shards=2,
+        symbols=symbols,
+        lease_manager=MagicMock(),
+    )
+
+    assert supervisor.num_shards == 2
+    assert supervisor.candidate_shards == [0, 1]
+    assert all(
+        len(get_symbols_for_shard(symbols, shard_id, supervisor.num_shards)) <= 1_024
+        for shard_id in supervisor.candidate_shards
+    )
+
+
+def test_pipeline_queue_pressure_and_fencing_metrics_are_exported():
+    metrics = PipelineMetrics(queue_size=90, queue_utilization_ratio=0.9, is_degraded=True)
+    publish_pipeline_metrics(991, metrics)
+    record_pipeline_outcome(991, "discarded_fenced", 2)
+
+    payload = generate_latest()
+    assert b'quantive_ws_pipeline_queue_depth{shard_id="991"} 90.0' in payload
+    assert b'quantive_ws_pipeline_degraded{shard_id="991"} 1.0' in payload
+    assert b'quantive_ws_pipeline_events_total{outcome="discarded_fenced",shard_id="991"} 2.0' in payload
+
+
 # ============================================================================
 # 4 - 11. Distributed Lease & Atomic Operations Tests
 # ============================================================================
@@ -117,12 +173,14 @@ async def test_4_worker_a_acquires_free_shard(fake_redis):
     assert claim.shard_id == 0
     assert claim.worker_id == "worker_a"
     assert claim.claim_token is not None
+    assert claim.fencing_token == 1
 
     # Verify Redis key contents
     owner = await mgr.get_current_owner(shard_id=0)
     assert owner is not None
     assert owner.worker_id == "worker_a"
     assert owner.claim_token == claim.claim_token
+    assert owner.fencing_token == claim.fencing_token
 
 
 @pytest.mark.asyncio
@@ -201,6 +259,9 @@ async def test_8_and_9_worker_a_loses_ownership_after_ttl_and_worker_b_acquires(
     claim_b = await mgr.acquire_shard_lease(shard_id=3, worker_id="worker_b")
     assert claim_b is not None
     assert claim_b.worker_id == "worker_b"
+    # Redis fencing generations advance only for successful ownership claims;
+    # a later PostgreSQL write fence can reject the paused old generation.
+    assert claim_b.fencing_token > claim_a.fencing_token
 
 
 @pytest.mark.asyncio
@@ -364,4 +425,35 @@ async def test_15_supervisor_stops_runtime_after_ownership_loss(fake_redis):
     assert runtime.state == ShardRuntimeState.FENCED
     assert 5 not in supervisor.owned_shard_ids
 
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_releases_redis_lease_when_database_persistence_fence_cannot_register(
+    fake_redis, monkeypatch
+):
+    """A Redis lease alone is insufficient; failed DB fencing must black-hole nothing."""
+    mgr = ShardLeaseManager(redis_client=fake_redis, lease_ttl_seconds=10.0)
+
+    class RejectingFencer:
+        def __init__(self, session_factory, claim):
+            self.claim = claim
+
+        async def register_claim(self):
+            return False
+
+    monkeypatch.setattr("app.services.ws_sharding.supervisor.ShardPersistenceFencer", RejectingFencer)
+    supervisor = ShardSupervisor(
+        worker_id="reject-persistence-fence",
+        candidate_shards=[6],
+        lease_manager=mgr,
+        # Supplying a DB factory activates the production persistence-fence
+        # boundary; it is never called by this rejecting test double.
+        session_factory=MagicMock(),
+    )
+
+    await supervisor.start()
+
+    assert supervisor.owned_shard_ids == []
+    assert await mgr.get_current_owner(6) is None
     await supervisor.shutdown()

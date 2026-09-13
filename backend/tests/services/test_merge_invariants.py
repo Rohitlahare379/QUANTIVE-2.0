@@ -21,6 +21,9 @@ from app.models.gap_repair_jobs import GapRepairJob
 from app.services.ingestion import IngestionService
 from app.connectors.exceptions import PayloadCorruptionError
 
+
+pytestmark = [pytest.mark.postgres, pytest.mark.timescaledb]
+
 engine = create_async_engine(settings.sqlalchemy_database_uri, poolclass=NullPool)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 
@@ -202,15 +205,35 @@ async def test_21_overlapping_repairs_merge_cleanly():
     t20 = now - timedelta(minutes=30)
     t50 = now
 
+    def coverage(start, end):
+        candles = []
+        current = start
+        while current <= end:
+            candles.append(
+                {
+                    "asset_id": asset_id,
+                    "timestamp": current,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1.0,
+                    "source": "binance_rest",
+                }
+            )
+            current += timedelta(minutes=1)
+        return candles
+
+    # Coverage metadata must be produced by the canonical raw write, never by
+    # an isolated metadata mutation.  This is also how an overlapping repair is
+    # performed after migration 014.
     async with AsyncSessionLocal() as session:
-        ingestion = IngestionService(session)
-        await ingestion.update_sync_ranges(asset_id, t0, t30)
-        await session.commit()
+        async with session.begin():
+            await IngestionService(session).commit_raw_batch_in_transaction(asset_id, coverage(t0, t30))
 
     async with AsyncSessionLocal() as session:
-        ingestion = IngestionService(session)
-        await ingestion.update_sync_ranges(asset_id, t20, t50)
-        await session.commit()
+        async with session.begin():
+            await IngestionService(session).commit_raw_batch_in_transaction(asset_id, coverage(t20, t50))
 
     async with AsyncSessionLocal() as session:
         ranges = (await session.execute(select(SyncRange).where(SyncRange.asset_id == asset_id))).scalars().all()

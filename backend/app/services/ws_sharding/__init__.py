@@ -7,6 +7,8 @@ from app.services.ws_sharding.assignment import (
     get_shard_for_symbol,
     get_symbols_for_shard,
     normalize_symbol,
+    required_shard_count,
+    ShardCapacityError,
 )
 from app.services.ws_sharding.lease import (
     RedisUnavailableError,
@@ -23,10 +25,15 @@ from app.services.ws_sharding.pipeline import (
 )
 from app.services.ws_sharding.registry import (
     AssetRegistryResolver,
+    AssetRegistryUnavailableError,
 )
 from app.services.ws_sharding.runtime import (
     ShardRuntime,
     ShardRuntimeState,
+)
+from app.services.ws_sharding.persistence_fence import (
+    ShardPersistenceFenceLostError,
+    ShardPersistenceFencer,
 )
 from app.services.ws_sharding.supervisor import (
     ShardSupervisor,
@@ -37,6 +44,8 @@ __all__ = [
     "get_shard_for_symbol",
     "get_symbols_for_shard",
     "normalize_symbol",
+    "required_shard_count",
+    "ShardCapacityError",
     "generate_worker_id",
     "RedisUnavailableError",
     "ShardLeaseClaim",
@@ -47,5 +56,8 @@ __all__ = [
     "BoundedLiveIngestionPipeline",
     "PipelineMetrics",
     "AssetRegistryResolver",
+    "AssetRegistryUnavailableError",
     "validate_candle_payload",
+    "ShardPersistenceFenceLostError",
+    "ShardPersistenceFencer",
 ]

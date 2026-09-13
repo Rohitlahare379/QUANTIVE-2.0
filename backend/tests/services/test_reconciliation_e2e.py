@@ -22,6 +22,9 @@ from app.models.gap_repair_jobs import GapRepairJob, GapRepairStatus
 from app.services.gap_repair import GapRepairService
 from app.services.ingestion import IngestionService
 
+
+pytestmark = [pytest.mark.postgres, pytest.mark.timescaledb]
+
 engine = create_async_engine(settings.sqlalchemy_database_uri, poolclass=NullPool)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 

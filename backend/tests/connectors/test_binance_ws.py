@@ -25,11 +25,13 @@ Covers all 20 required verification scenarios:
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+from typing import Dict
 import pytest
 import pytest_asyncio
 import websockets
+from unittest.mock import AsyncMock, patch
 try:
     from websockets.asyncio.server import serve
 except ImportError:
@@ -279,6 +281,16 @@ def test_17_subscription_failure_on_empty():
         BinanceWebSocketClient(symbols=[])
 
 
+def test_subscription_capacity_is_enforced_before_any_network_connection():
+    symbols = [f"CAPACITY{i:04d}USDT" for i in range(1_025)]
+    streams = [build_kline_stream_name(symbol) for symbol in symbols]
+
+    with pytest.raises(ValueError, match="exceeds configured per-connection stream capacity"):
+        build_subscription_payload(streams)
+    with pytest.raises(InvalidSymbolError, match="more streams than one Binance connection can own"):
+        BinanceWebSocketClient(symbols=symbols)
+
+
 @pytest.mark.asyncio
 async def test_11_and_13_connection_lifecycle_and_clean_shutdown():
     """11. Connection open lifecycle transitions & 13. Clean shutdown does not reconnect."""
@@ -318,6 +330,126 @@ async def test_11_and_13_connection_lifecycle_and_clean_shutdown():
 
     server.close()
     await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_subscription_rejection_fails_closed_and_closes_the_open_socket():
+    """A sent-but-rejected subscription never becomes a falsely healthy shard."""
+    websocket = AsyncMock()
+    websocket.recv.return_value = json.dumps({"code": 2, "msg": "Invalid symbol.", "id": 2})
+
+    with patch("app.connectors.binance_ws.websockets.connect", new=AsyncMock(return_value=websocket)):
+        client = BinanceWebSocketClient(symbols=["NOPEUSDT"], ws_base_url="ws://example.invalid")
+        with pytest.raises(SubscriptionError, match="rejected"):
+            await client.connect()
+
+    websocket.close.assert_awaited_once()
+    assert client.state is WebSocketConnectionState.FAILED
+    assert client.is_connected is False
+
+
+@pytest.mark.asyncio
+async def test_subscription_ack_timeout_fails_closed_and_closes_socket():
+    websocket = AsyncMock()
+    websocket.recv.side_effect = asyncio.TimeoutError()
+
+    with patch("app.connectors.binance_ws.websockets.connect", new=AsyncMock(return_value=websocket)):
+        client = BinanceWebSocketClient(
+            symbols=["BTCUSDT"],
+            ws_base_url="ws://example.invalid",
+            subscription_ack_timeout_seconds=0.01,
+        )
+        with pytest.raises(SubscriptionError, match="Timed out"):
+            await client.connect()
+
+    websocket.close.assert_awaited_once()
+    assert client.state is WebSocketConnectionState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_matching_request_id_without_explicit_success_ack_fails_closed():
+    """A malformed control frame cannot advertise an unsubscribed shard as RUNNING."""
+    websocket = AsyncMock()
+    websocket.recv.return_value = json.dumps({"id": 2})
+
+    with patch("app.connectors.binance_ws.websockets.connect", new=AsyncMock(return_value=websocket)):
+        client = BinanceWebSocketClient(symbols=["BTCUSDT"], ws_base_url="ws://example.invalid")
+        with pytest.raises(SubscriptionError, match="rejected"):
+            await client.connect()
+
+    websocket.close.assert_awaited_once()
+    assert client.state is WebSocketConnectionState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_repeated_subscription_handshake_failures_keep_exponential_backoff_progression():
+    """A TCP-open but ACK-rejected stream must not reset reconnect backoff."""
+    sockets = []
+    for _ in range(3):
+        websocket = AsyncMock()
+        websocket.recv.return_value = json.dumps({"code": 2, "msg": "Invalid symbol.", "id": 2})
+        sockets.append(websocket)
+
+    backoff_attempts = []
+    sleep_delays = []
+    client = BinanceWebSocketClient(symbols=["NOPEUSDT"], ws_base_url="ws://example.invalid")
+
+    def fake_backoff(attempt, *args, **kwargs):
+        backoff_attempts.append(attempt)
+        return float(attempt)
+
+    async def stop_after_third_retry(delay):
+        sleep_delays.append(delay)
+        if len(sleep_delays) == 3:
+            client._stop_requested = True
+
+    async def consume():
+        async for _ in client.stream_final_candles():
+            pass
+
+    with (
+        patch("app.connectors.binance_ws.websockets.connect", new=AsyncMock(side_effect=sockets)),
+        patch("app.connectors.binance_ws.calculate_reconnect_backoff", side_effect=fake_backoff),
+        patch("app.connectors.binance_ws.asyncio.sleep", side_effect=stop_after_third_retry),
+    ):
+        await asyncio.wait_for(consume(), timeout=1.0)
+
+    assert backoff_attempts == [1, 2, 3]
+    assert sleep_delays == [1.0, 2.0, 3.0]
+    assert client._reconnect_attempts == 3
+    for websocket in sockets:
+        websocket.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_planned_rotation_retains_old_socket_and_closes_replacement():
+    """A failed replacement ACK cannot orphan the still-live old subscription."""
+    old_websocket = AsyncMock()
+    old_websocket.closed = False
+    replacement = AsyncMock()
+    replacement.closed = False
+    replacement.recv.return_value = json.dumps({"code": 2, "msg": "Invalid symbol.", "id": 2})
+    client = BinanceWebSocketClient(symbols=["BTCUSDT"], ws_base_url="ws://example.invalid")
+    client._websocket = old_websocket
+    client._state = WebSocketConnectionState.RUNNING
+    client._connected_at = datetime.now(timezone.utc) - timedelta(days=2)
+
+    with (
+        patch("app.connectors.binance_ws.websockets.connect", new=AsyncMock(return_value=replacement)),
+        patch("app.connectors.binance_ws.calculate_reconnect_backoff", return_value=12.0),
+    ):
+        retained = await client._rotate_connection()
+
+    assert retained is old_websocket
+    assert client._websocket is old_websocket
+    assert client.state is WebSocketConnectionState.RUNNING
+    assert client._rotation_retry_at is not None
+    assert client._should_rotate_connection() is False
+    replacement.close.assert_awaited_once()
+    old_websocket.close.assert_not_awaited()
+
+    await client.disconnect()
+    old_websocket.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -531,4 +663,3 @@ async def test_25_connector_error_and_lifecycle_hooks():
     assert closed_called is True
     server.close()
     await server.wait_closed()
-

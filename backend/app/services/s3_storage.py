@@ -1,5 +1,6 @@
 import os
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from app.core.config import settings
 import logging
@@ -15,7 +16,15 @@ class S3StorageService:
             endpoint_url=settings.S3_ENDPOINT_URL,
             aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION
+            region_name=settings.AWS_REGION,
+            # A lease heartbeat cannot safely bound a blocked socket by itself:
+            # make storage connects/reads finite so a stale upload can release
+            # its token-scoped temporary artifact.
+            config=Config(
+                connect_timeout=settings.S3_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=settings.S3_READ_TIMEOUT_SECONDS,
+                retries={"mode": "standard", "max_attempts": settings.S3_MAX_ATTEMPTS},
+            ),
         )
         self.bucket = settings.S3_EXPORT_BUCKET
         self._ensure_bucket_exists()
@@ -37,6 +46,15 @@ class S3StorageService:
             return True
         except ClientError as e:
             logger.error(f"Upload failed: {e}")
+            return False
+
+    def delete_file(self, object_name: str) -> bool:
+        """Best-effort cleanup for an artifact from a fenced export attempt."""
+        try:
+            self.s3_client.delete_object(Bucket=self.bucket, Key=object_name)
+            return True
+        except ClientError as e:
+            logger.error(f"Export artifact cleanup failed: {e}")
             return False
 
     def generate_presigned_url(self, object_name: str, expiration: int = settings.S3_PRESIGNED_EXPIRY_SECONDS) -> str:
