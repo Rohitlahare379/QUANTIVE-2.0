@@ -30,6 +30,10 @@ async def list_assets(
     return assets[offset : offset + limit]
 
 @router.get("/{symbol}", response_model=AssetResponse)
-async def get_asset(symbol: str, db: AsyncSession = Depends(get_db)):
+async def get_asset(
+    symbol: str,
+    exchange: str = "BINANCE",
+    db: AsyncSession = Depends(get_db),
+):
     service = AssetQueryService(db)
-    return await service.get_asset_by_symbol(symbol)
+    return await service.get_asset_by_symbol(symbol, exchange=exchange)

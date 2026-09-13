@@ -87,3 +87,28 @@ def test_38_multiple_affected_timeframes_union():
 
     assert aligned_start == datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     assert aligned_end == datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("timeframe", "start", "end", "expected_end"),
+    [
+        ("5m", datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, 10, 5, tzinfo=timezone.utc), datetime(2026, 1, 1, 10, 10, tzinfo=timezone.utc)),
+        ("15m", datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, 10, 15, tzinfo=timezone.utc), datetime(2026, 1, 1, 10, 30, tzinfo=timezone.utc)),
+        ("1h", datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc), datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)),
+        ("4h", datetime(2026, 1, 1, 2, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, 4, 0, tzinfo=timezone.utc), datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc)),
+        (None, datetime(2026, 1, 1, 10, 1, tzinfo=timezone.utc), datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc), datetime(2026, 1, 3, 0, 0, tzinfo=timezone.utc)),
+    ],
+)
+def test_inclusive_canonical_end_on_bucket_boundary_refreshes_that_bucket(
+    timeframe, start, end, expected_end
+):
+    """A repaired candle at an exact boundary cannot be excluded by [start,end)."""
+    aligned_start, aligned_end = compute_cagg_bucket_alignment(
+        start,
+        end,
+        timeframe=timeframe,
+        end_inclusive=True,
+    )
+
+    assert aligned_start <= start
+    assert aligned_end == expected_end

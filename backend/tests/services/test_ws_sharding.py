@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 import fakeredis.aioredis
 import pytest
 import pytest_asyncio
+from unittest.mock import MagicMock
 
 from app.services.ws_sharding.assignment import (
     assign_symbols_to_shards,
@@ -117,12 +118,14 @@ async def test_4_worker_a_acquires_free_shard(fake_redis):
     assert claim.shard_id == 0
     assert claim.worker_id == "worker_a"
     assert claim.claim_token is not None
+    assert claim.fencing_token == 1
 
     # Verify Redis key contents
     owner = await mgr.get_current_owner(shard_id=0)
     assert owner is not None
     assert owner.worker_id == "worker_a"
     assert owner.claim_token == claim.claim_token
+    assert owner.fencing_token == claim.fencing_token
 
 
 @pytest.mark.asyncio
@@ -201,6 +204,9 @@ async def test_8_and_9_worker_a_loses_ownership_after_ttl_and_worker_b_acquires(
     claim_b = await mgr.acquire_shard_lease(shard_id=3, worker_id="worker_b")
     assert claim_b is not None
     assert claim_b.worker_id == "worker_b"
+    # Redis fencing generations advance only for successful ownership claims;
+    # a later PostgreSQL write fence can reject the paused old generation.
+    assert claim_b.fencing_token > claim_a.fencing_token
 
 
 @pytest.mark.asyncio
@@ -364,4 +370,35 @@ async def test_15_supervisor_stops_runtime_after_ownership_loss(fake_redis):
     assert runtime.state == ShardRuntimeState.FENCED
     assert 5 not in supervisor.owned_shard_ids
 
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_releases_redis_lease_when_database_persistence_fence_cannot_register(
+    fake_redis, monkeypatch
+):
+    """A Redis lease alone is insufficient; failed DB fencing must black-hole nothing."""
+    mgr = ShardLeaseManager(redis_client=fake_redis, lease_ttl_seconds=10.0)
+
+    class RejectingFencer:
+        def __init__(self, session_factory, claim):
+            self.claim = claim
+
+        async def register_claim(self):
+            return False
+
+    monkeypatch.setattr("app.services.ws_sharding.supervisor.ShardPersistenceFencer", RejectingFencer)
+    supervisor = ShardSupervisor(
+        worker_id="reject-persistence-fence",
+        candidate_shards=[6],
+        lease_manager=mgr,
+        # Supplying a DB factory activates the production persistence-fence
+        # boundary; it is never called by this rejecting test double.
+        session_factory=MagicMock(),
+    )
+
+    await supervisor.start()
+
+    assert supervisor.owned_shard_ids == []
+    assert await mgr.get_current_owner(6) is None
     await supervisor.shutdown()

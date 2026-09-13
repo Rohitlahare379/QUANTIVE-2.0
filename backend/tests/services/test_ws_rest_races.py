@@ -25,6 +25,9 @@ from app.services.ingestion import IngestionService
 from app.services.ws_sharding.pipeline import BoundedLiveIngestionPipeline
 from app.services.ws_sharding.registry import AssetRegistryResolver
 
+
+pytestmark = [pytest.mark.postgres, pytest.mark.timescaledb]
+
 engine = create_async_engine(settings.sqlalchemy_database_uri, poolclass=NullPool)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 

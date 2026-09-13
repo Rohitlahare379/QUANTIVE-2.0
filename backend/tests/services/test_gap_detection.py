@@ -19,6 +19,9 @@ from app.models.gap_staging_candles import GapStagingCandle
 from app.services.gap_repair import GapRepairService
 from app.services.ingestion import IngestionService
 
+
+pytestmark = [pytest.mark.postgres, pytest.mark.timescaledb]
+
 engine = create_async_engine(settings.sqlalchemy_database_uri, poolclass=NullPool)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 
@@ -51,6 +54,45 @@ async def _create_test_asset(symbol: str = "BTCUSDT") -> int:
         return asset.id
 
 
+def _coverage_candles(asset_id: int, start: datetime, end: datetime) -> list[dict]:
+    """Build genuine canonical coverage for a sync-range fixture.
+
+    ``sync_ranges`` is deliberately no longer a free-standing test fixture: the
+    production trigger rejects a range unless every minute it claims is in raw
+    storage.  These tests exercise gap detection, so construct the minimum real
+    raw data required for each coverage interval rather than bypassing that
+    invariant with direct ORM inserts.
+    """
+    candles = []
+    current = start
+    while current <= end:
+        candles.append(
+            {
+                "asset_id": asset_id,
+                "timestamp": current,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1.0,
+                "source": "binance_rest",
+            }
+        )
+        current += timedelta(minutes=1)
+    return candles
+
+
+async def _persist_coverage(asset_id: int, *intervals: tuple[datetime, datetime]) -> None:
+    """Persist fixture coverage through the same raw→sync_ranges path as production."""
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            ingestion = IngestionService(session)
+            for start, end in intervals:
+                await ingestion.commit_raw_batch_in_transaction(
+                    asset_id, _coverage_candles(asset_id, start, end)
+                )
+
+
 @pytest.mark.asyncio
 async def test_1_one_minute_gap():
     """
@@ -64,10 +106,7 @@ async def test_1_one_minute_gap():
     t4 = datetime(2026, 1, 1, 10, 4, tzinfo=timezone.utc)
     t10 = datetime(2026, 1, 1, 10, 10, tzinfo=timezone.utc)
 
-    async with AsyncSessionLocal() as session:
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t0, end_timestamp=t2))
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t4, end_timestamp=t10))
-        await session.commit()
+    await _persist_coverage(asset_id, (t0, t2), (t4, t10))
 
     service = GapRepairService(session_factory=AsyncSessionLocal)
     gaps = await service.detect_gaps(asset_id, t0, t10)
@@ -87,10 +126,7 @@ async def test_2_multi_minute_gap():
     t25 = datetime(2026, 1, 1, 10, 25, tzinfo=timezone.utc)
     t40 = datetime(2026, 1, 1, 10, 40, tzinfo=timezone.utc)
 
-    async with AsyncSessionLocal() as session:
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t0, end_timestamp=t10))
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t25, end_timestamp=t40))
-        await session.commit()
+    await _persist_coverage(asset_id, (t0, t10), (t25, t40))
 
     service = GapRepairService(session_factory=AsyncSessionLocal)
     gaps = await service.detect_gaps(asset_id, t0, t40)
@@ -110,10 +146,7 @@ async def test_3_multi_hour_gap():
     t_h8 = datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc)
     t_h12 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 
-    async with AsyncSessionLocal() as session:
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t_start, end_timestamp=t_h2))
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t_h8, end_timestamp=t_h12))
-        await session.commit()
+    await _persist_coverage(asset_id, (t_start, t_h2), (t_h8, t_h12))
 
     service = GapRepairService(session_factory=AsyncSessionLocal)
     gaps = await service.detect_gaps(asset_id, t_start, t_h12)
@@ -129,20 +162,17 @@ async def test_4_multi_day_gap():
     """
     asset_id = await _create_test_asset("ADAUSDT")
     t_jan1 = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
-    t_jan3 = datetime(2026, 1, 3, 0, 0, tzinfo=timezone.utc)
     t_jan10 = datetime(2026, 1, 10, 0, 0, tzinfo=timezone.utc)
-    t_jan15 = datetime(2026, 1, 15, 0, 0, tzinfo=timezone.utc)
 
-    async with AsyncSessionLocal() as session:
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t_jan1, end_timestamp=t_jan3))
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t_jan10, end_timestamp=t_jan15))
-        await session.commit()
+    # Single-minute coverage at either side is sufficient to verify a multi-day
+    # missing interval and keeps this database-backed fixture bounded.
+    await _persist_coverage(asset_id, (t_jan1, t_jan1), (t_jan10, t_jan10))
 
     service = GapRepairService(session_factory=AsyncSessionLocal)
-    gaps = await service.detect_gaps(asset_id, t_jan1, t_jan15)
+    gaps = await service.detect_gaps(asset_id, t_jan1, t_jan10)
 
     assert len(gaps) == 1
-    assert gaps[0] == (t_jan3, t_jan10)
+    assert gaps[0] == (t_jan1, t_jan10)
 
 
 @pytest.mark.asyncio
@@ -159,11 +189,7 @@ async def test_5_multiple_separated_gaps():
     t5 = datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc)
 
     # Existing: [t0, t1], [t2, t3], [t4, t5]
-    async with AsyncSessionLocal() as session:
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t0, end_timestamp=t1))
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t2, end_timestamp=t3))
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t4, end_timestamp=t5))
-        await session.commit()
+    await _persist_coverage(asset_id, (t0, t1), (t2, t3), (t4, t5))
 
     service = GapRepairService(session_factory=AsyncSessionLocal)
     gaps = await service.detect_gaps(asset_id, t0, t5)
@@ -185,17 +211,8 @@ async def test_6_adjacent_gaps_merge_semantics():
     t11 = datetime(2026, 1, 1, 10, 11, tzinfo=timezone.utc)
     t20 = datetime(2026, 1, 1, 10, 20, tzinfo=timezone.utc)
 
-    # First add [10:00, 10:10]
-    async with AsyncSessionLocal() as session:
-        ingestion = IngestionService(session)
-        await ingestion.update_sync_ranges(asset_id, t0, t10)
-        await session.commit()
-
-    # Now add adjacent [10:11, 10:20] -> update_sync_ranges merges them into [10:00, 10:20]
-    async with AsyncSessionLocal() as session:
-        ingestion = IngestionService(session)
-        await ingestion.update_sync_ranges(asset_id, t11, t20)
-        await session.commit()
+    # Adjacent real raw blocks merge into one verified coverage interval.
+    await _persist_coverage(asset_id, (t0, t10), (t11, t20))
 
     service = GapRepairService(session_factory=AsyncSessionLocal)
     gaps = await service.detect_gaps(asset_id, t0, t20)
@@ -213,9 +230,7 @@ async def test_7_overlapping_gaps_query():
     t10 = datetime(2026, 1, 1, 10, 10, tzinfo=timezone.utc)
     t20 = datetime(2026, 1, 1, 10, 20, tzinfo=timezone.utc)
 
-    async with AsyncSessionLocal() as session:
-        session.add(SyncRange(asset_id=asset_id, start_timestamp=t10, end_timestamp=t20))
-        await session.commit()
+    await _persist_coverage(asset_id, (t10, t20))
 
     # Query from 10:00 to 10:30 (wraps around existing [10:10, 10:20])
     t0 = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)

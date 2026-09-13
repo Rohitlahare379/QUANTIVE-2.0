@@ -1,7 +1,7 @@
 import pytest
 from httpx import AsyncClient
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.main import app
 from app.api.auth import verify_api_key
@@ -26,6 +26,57 @@ async def test_health_check(async_client):
     response = await async_client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
+    assert response.json()["kind"] == "liveness"
+
+
+@pytest.mark.asyncio
+async def test_readiness_requires_both_database_and_redis(async_client):
+    with (
+        patch("app.api.routes.health._database_ready", new=AsyncMock(return_value=True)),
+        patch("app.api.routes.health._redis_ready", new=AsyncMock(return_value=True)),
+    ):
+        response = await async_client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "checks": {"database": "reachable", "redis": "reachable"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_closed_when_redis_is_unavailable(async_client):
+    with (
+        patch("app.api.routes.health._database_ready", new=AsyncMock(return_value=True)),
+        patch("app.api.routes.health._redis_ready", new=AsyncMock(return_value=False)),
+    ):
+        response = await async_client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "status": "unready",
+        "checks": {"database": "reachable", "redis": "unavailable"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_metrics_explicitly_reports_a_failed_dependency_scrape(async_client):
+    """A dependency outage must not leave Prometheus with a false healthy scrape."""
+    with (
+        patch(
+            "app.api.routes.metrics._collect_cagg_metrics",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "app.api.routes.metrics._collect_dlq_metrics",
+            new=AsyncMock(return_value=True),
+        ),
+    ):
+        response = await async_client.get("/metrics")
+
+    assert response.status_code == 200
+    assert b'quantive_metrics_dependency_up{dependency="database"} 0.0' in response.content
+    assert b'quantive_metrics_dependency_up{dependency="redis"} 1.0' in response.content
 
 @pytest.mark.asyncio
 async def test_get_assets(async_client):
@@ -92,12 +143,14 @@ async def test_get_candles_stream(async_client):
 
 def test_proxy_ip_extraction():
     from app.api.dependencies import get_trusted_client_ip
+    from app.core.config import Settings
     from fastapi import Request
     
     # 1. Test CF-Connecting-IP
     scope = {
         "type": "http",
-        "headers": [(b"cf-connecting-ip", b"203.0.113.1")]
+        "headers": [(b"cf-connecting-ip", b"203.0.113.1")],
+        "client": ("127.0.0.1", 12345),
     }
     req = Request(scope)
     assert get_trusted_client_ip(req) == "203.0.113.1"
@@ -105,7 +158,8 @@ def test_proxy_ip_extraction():
     # 2. Test X-Real-IP
     scope = {
         "type": "http",
-        "headers": [(b"x-real-ip", b"198.51.100.1")]
+        "headers": [(b"x-real-ip", b"198.51.100.1")],
+        "client": ("127.0.0.1", 12345),
     }
     req = Request(scope)
     assert get_trusted_client_ip(req) == "198.51.100.1"
@@ -119,9 +173,30 @@ def test_proxy_ip_extraction():
     req = Request(scope)
     assert get_trusted_client_ip(req) == "192.0.2.1"
 
+    # An arbitrary Internet client cannot evade rate limiting by forging a
+    # forwarding header; only a configured ingress proxy is trusted.
+    scope = {
+        "type": "http",
+        "headers": [(b"cf-connecting-ip", b"203.0.113.1")],
+        "client": ("198.51.100.77", 12345),
+    }
+    req = Request(scope)
+    assert get_trusted_client_ip(req) == "198.51.100.77"
+
+    with pytest.raises(ValueError, match="TRUSTED_PROXY_CIDRS"):
+        Settings(TRUSTED_PROXY_CIDRS="not-a-network")
+
 def test_limiter_redis_backend():
     from app.api.dependencies import limiter
     from limits.storage.redis import RedisStorage
     
     assert isinstance(limiter._storage, RedisStorage)
     assert limiter._storage.storage.connection_pool.connection_kwargs["socket_connect_timeout"] == 2
+
+
+def test_production_settings_refuse_development_secrets_and_local_redis_default():
+    """A deployment typo must fail startup, not publish known development credentials."""
+    from app.core.config import Settings
+
+    with pytest.raises(ValueError, match="non-development environment cannot use development defaults"):
+        Settings(ENVIRONMENT="production")

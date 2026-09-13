@@ -7,7 +7,7 @@ and streaming of normalized finalized candle events.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import enum
 import json
 import logging
@@ -96,6 +96,7 @@ class BinanceWebSocketClient:
         max_connection_lifetime_seconds: Optional[float] = None,
         ping_interval_seconds: Optional[float] = None,
         ping_timeout_seconds: Optional[float] = None,
+        subscription_ack_timeout_seconds: Optional[float] = None,
         on_connection_opened: Optional[Callable[[], Any]] = None,
         on_connection_closed: Optional[Callable[[Optional[int], Optional[str]], Any]] = None,
         on_reconnect: Optional[Callable[[int, float], Any]] = None,
@@ -117,6 +118,13 @@ class BinanceWebSocketClient:
         )
         self.ping_interval = ping_interval_seconds or settings.BINANCE_WS_PING_INTERVAL_SECONDS
         self.ping_timeout = ping_timeout_seconds or settings.BINANCE_WS_PING_TIMEOUT_SECONDS
+        self.subscription_ack_timeout = (
+            subscription_ack_timeout_seconds
+            if subscription_ack_timeout_seconds is not None
+            else settings.BINANCE_WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS
+        )
+        if self.subscription_ack_timeout <= 0:
+            raise ValueError("subscription_ack_timeout_seconds must be positive")
 
         # Observability Hooks
         self.on_connection_opened = on_connection_opened
@@ -137,6 +145,10 @@ class BinanceWebSocketClient:
         self._websocket: Optional[websockets.WebSocketClientProtocol] = None
         self._stop_requested = False
         self._connected_at: Optional[datetime] = None
+        # A failed planned rotation must not throw away a still-healthy old
+        # connection, nor retry a replacement once per incoming frame.  This
+        # timestamp is a bounded retry gate for the replacement only.
+        self._rotation_retry_at: Optional[datetime] = None
         self._reconnect_attempts = 0
         self._active_req_id = 1
         self._lock = asyncio.Lock()
@@ -174,6 +186,7 @@ class BinanceWebSocketClient:
         url = self._get_stream_url()
         logger.info(f"Connecting to Binance WebSocket endpoint: {url}")
 
+        ws: Optional[Any] = None
         try:
             ws = await websockets.connect(
                 url,
@@ -185,7 +198,6 @@ class BinanceWebSocketClient:
             self._websocket = ws
             self._state = WebSocketConnectionState.CONNECTED
             self._connected_at = datetime.now(timezone.utc)
-            self._reconnect_attempts = 0
             logger.info(f"Successfully connected to Binance WebSocket at {url}")
 
             if self.on_connection_opened:
@@ -198,9 +210,25 @@ class BinanceWebSocketClient:
             await self._subscribe(ws)
 
             self._state = WebSocketConnectionState.RUNNING
+            # A TCP connection alone is not a successful reconnect: it may be
+            # rejected by Binance during SUBSCRIBE.  Reset the exponential
+            # reconnect sequence only after the matching acknowledgement has
+            # been accepted.
+            self._reconnect_attempts = 0
+            self._rotation_retry_at = None
             return ws
 
         except Exception as e:
+            # A transport can be established but fail subscription.  Do not
+            # leave that socket alive: it would consume a Binance connection
+            # slot while the runtime believes the shard failed closed.
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            self._websocket = None
+            self._connected_at = None
             self._state = WebSocketConnectionState.FAILED
             logger.error(f"Failed to connect to Binance WebSocket: {e}")
             if self.on_protocol_error:
@@ -221,11 +249,54 @@ class BinanceWebSocketClient:
         
         try:
             await ws.send(payload)
+            # Sending a SUBSCRIBE command is not proof it was accepted.  Wait
+            # for the matching Binance control response before advertising this
+            # connection as RUNNING; an invalid/sharded symbol must become a
+            # visible reconnecting failure rather than silent data absence.
+            raw_ack = await asyncio.wait_for(ws.recv(), timeout=self.subscription_ack_timeout)
+            try:
+                ack = json.loads(raw_ack)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise SubscriptionError("Malformed Binance subscription acknowledgement") from exc
+
+            if not isinstance(ack, dict) or ack.get("id") != self._active_req_id:
+                raise SubscriptionError(
+                    f"Unexpected Binance subscription acknowledgement for request {self._active_req_id}"
+                )
+            # Binance's successful control response is exactly an explicit
+            # ``result: null`` paired with our request id.  A bare matching
+            # id is not evidence that streams were accepted; accepting it
+            # would leave a shard falsely RUNNING with no subscriptions.
+            if (
+                "code" in ack
+                or "error" in ack
+                or "result" not in ack
+                or ack.get("result") is not None
+            ):
+                detail = ack.get("msg") or ack.get("error") or ack.get("result") or "unknown subscription error"
+                raise SubscriptionError(f"Binance subscription rejected: {detail}")
+
             if self.on_subscription_success:
                 try:
                     self.on_subscription_success(self.stream_names)
                 except Exception:
                     pass
+        except asyncio.TimeoutError as exc:
+            logger.error("Timed out waiting for Binance subscription acknowledgement")
+            if self.on_subscription_failure:
+                try:
+                    self.on_subscription_failure("subscription acknowledgement timed out")
+                except Exception:
+                    pass
+            raise SubscriptionError("Timed out waiting for Binance subscription acknowledgement") from exc
+        except SubscriptionError as exc:
+            logger.error("Binance subscription failed: %s", exc)
+            if self.on_subscription_failure:
+                try:
+                    self.on_subscription_failure(str(exc))
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             logger.error(f"Failed to send subscription payload: {e}")
             if self.on_subscription_failure:
@@ -265,7 +336,12 @@ class BinanceWebSocketClient:
         """
         if not self._connected_at:
             return False
-        elapsed = (datetime.now(timezone.utc) - self._connected_at).total_seconds()
+        now = datetime.now(timezone.utc)
+        if self._rotation_retry_at is not None:
+            if now < self._rotation_retry_at:
+                return False
+            self._rotation_retry_at = None
+        elapsed = (now - self._connected_at).total_seconds()
         return elapsed >= self.max_connection_lifetime
 
     async def _rotate_connection(self) -> Any:
@@ -278,19 +354,50 @@ class BinanceWebSocketClient:
         logger.info("Initiating planned 24-hour WebSocket connection rotation...")
         old_ws = self._websocket
 
-        # Connect replacement
-        new_ws = await websockets.connect(
-            self._get_stream_url(),
-            ping_interval=self.ping_interval,
-            ping_timeout=self.ping_timeout,
-            close_timeout=5.0,
-        )
-        await self._subscribe(new_ws)
+        new_ws: Optional[Any] = None
+        try:
+            # Connect replacement.
+            new_ws = await websockets.connect(
+                self._get_stream_url(),
+                ping_interval=self.ping_interval,
+                ping_timeout=self.ping_timeout,
+                close_timeout=5.0,
+            )
+            await self._subscribe(new_ws)
+        except Exception as exc:
+            # Keep a known-good old socket alive when a replacement cannot be
+            # connected or subscribed.  Propagating this error to
+            # ``stream_all_candles`` would clear ``self._websocket`` and
+            # orphan the old live connection.  Retry rotation with the same
+            # exponential backoff used for reconnects, but continue consuming
+            # the authoritative old stream in the meantime.
+            if new_ws is not None:
+                try:
+                    await new_ws.close()
+                except Exception:
+                    pass
+            self._reconnect_attempts += 1
+            delay = calculate_reconnect_backoff(self._reconnect_attempts)
+            self._rotation_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            if old_ws is not None and self.is_connected:
+                self._websocket = old_ws
+                self._state = WebSocketConnectionState.RUNNING
+                logger.warning(
+                    "Planned Binance WebSocket rotation failed; retaining existing connection and retrying in %.2fs: %s",
+                    delay,
+                    exc,
+                )
+                return old_ws
+            # There is no safe stream to retain.  The outer reconnect path
+            # will clear the failed socket and reconnect with backoff.
+            raise
 
         # Cut over
         self._websocket = new_ws
         self._connected_at = datetime.now(timezone.utc)
         self._state = WebSocketConnectionState.RUNNING
+        self._reconnect_attempts = 0
+        self._rotation_retry_at = None
 
         # Close old connection gracefully
         if old_ws:

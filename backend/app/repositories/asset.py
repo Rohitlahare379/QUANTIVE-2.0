@@ -7,8 +7,14 @@ class AssetRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def get_by_symbol(self, symbol: str) -> Optional[AssetRegistry]:
-        stmt = select(AssetRegistry).where(AssetRegistry.symbol == symbol)
+    async def get_by_symbol(
+        self, symbol: str, exchange: str = "BINANCE"
+    ) -> Optional[AssetRegistry]:
+        """Resolve an asset using its real transport identity, not symbol alone."""
+        stmt = select(AssetRegistry).where(
+            AssetRegistry.symbol == symbol.strip().upper(),
+            AssetRegistry.exchange == exchange.strip().upper(),
+        )
         result = await self.db.execute(stmt)
         return result.scalars().first()
         

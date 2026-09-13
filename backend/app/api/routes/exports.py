@@ -11,6 +11,7 @@ from app.models.export_jobs import ExportJob
 from app.services.s3_storage import S3StorageService
 from app.workers.export import process_export_job
 from app.services.query import TIMEFRAME_TABLE_MAP
+from app.core.config import settings
 
 router = APIRouter(prefix="/exports", tags=["Historical Exports"])
 
@@ -53,7 +54,8 @@ async def create_export(
         asset_id=req.asset_id,
         timeframe=req.timeframe,
         start_time=start,
-        end_time=end
+        end_time=end,
+        max_attempts=settings.EXPORT_MAX_ATTEMPTS,
     )
     db.add(job)
     await db.commit()

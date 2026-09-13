@@ -27,6 +27,11 @@ from app.models.cagg_refresh_jobs import CaggRefreshJob
 from app.services.gap_repair import GapRepairService
 from app.services.ingestion import IngestionService
 
+
+# Even the mocked failure cases share the autouse fixture that creates and
+# deletes canonical rows, so this module requires the real migrated schema.
+pytestmark = [pytest.mark.postgres, pytest.mark.timescaledb]
+
 engine = create_async_engine(settings.sqlalchemy_database_uri, poolclass=NullPool)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 
@@ -100,8 +105,9 @@ async def test_40_postgresql_failure_during_batch_commit():
     service = GapRepairService(session_factory=AsyncSessionLocal, binance_client=mock_client)
     job = await service.schedule_repair_job(asset_id, "BTCUSDT", start, end)
 
-    # Simulate database failure in IngestionService._commit_batch
-    with patch("app.services.ingestion.IngestionService._commit_batch", side_effect=RuntimeError("Database connection dropped")):
+    # The fenced worker uses the transaction-owning canonical write API.  Fail
+    # that exact boundary so this remains a real no-false-coverage regression.
+    with patch("app.services.ingestion.IngestionService.commit_batch_in_transaction", side_effect=RuntimeError("Database connection dropped")):
         with pytest.raises(Exception):
             await service.process_next_job(worker_id="w1", binance_client=mock_client)
 
@@ -219,11 +225,32 @@ async def test_44_large_synthetic_gap_reconstruction():
     t3_start = start + timedelta(days=2)
     t3_end = t3_start + timedelta(hours=12)
 
+    def coverage(range_start, range_end):
+        candles = []
+        current = range_start
+        while current <= range_end:
+            candles.append(
+                {
+                    "asset_id": asset_id,
+                    "timestamp": current,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1.0,
+                    "source": "binance_rest",
+                }
+            )
+            current += timedelta(minutes=1)
+        return candles
+
+    # Fixture ranges are derived from real raw rows so the database coverage
+    # trigger is exercised rather than bypassed.
     async with AsyncSessionLocal() as session:
-        ingestion = IngestionService(session)
-        await ingestion.update_sync_ranges(asset_id, start, t1_end)
-        await ingestion.update_sync_ranges(asset_id, t3_start, t3_end)
-        await session.commit()
+        async with session.begin():
+            ingestion = IngestionService(session)
+            await ingestion.commit_raw_batch_in_transaction(asset_id, coverage(start, t1_end))
+            await ingestion.commit_raw_batch_in_transaction(asset_id, coverage(t3_start, t3_end))
 
     service = GapRepairService(session_factory=AsyncSessionLocal)
     gaps = await service.detect_gaps(asset_id, start, t3_end)

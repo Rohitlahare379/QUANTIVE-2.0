@@ -1,7 +1,8 @@
 from datetime import datetime
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy import DateTime, Float, ForeignKey
+from sqlalchemy import CheckConstraint, DateTime, Float, ForeignKey, Integer, String
 from .base import Base
+from .raw_1m_candles import _OHLCV_VALIDITY_CHECK
 
 class GapStagingCandle(Base):
     """
@@ -19,3 +20,17 @@ class GapStagingCandle(Base):
     low: Mapped[float] = mapped_column(Float, nullable=False)
     close: Mapped[float] = mapped_column(Float, nullable=False)
     volume: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, server_default="unknown")
+    source_event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    data_revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+
+    __table_args__ = (
+        CheckConstraint(_OHLCV_VALIDITY_CHECK, name="ck_gap_staging_candles_ohlcv_valid"),
+        CheckConstraint(
+            "date_trunc('minute', timestamp) = timestamp",
+            name="ck_gap_staging_candles_timestamp_minute",
+        ),
+        CheckConstraint("length(btrim(source)) > 0", name="ck_gap_staging_candles_source_nonempty"),
+        CheckConstraint("data_revision > 0", name="ck_gap_staging_candles_positive_revision"),
+    )

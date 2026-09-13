@@ -21,6 +21,7 @@ from app.services.ws_sharding.lease import (
 )
 from app.services.ws_sharding.registry import AssetRegistryResolver
 from app.services.ws_sharding.runtime import ShardRuntime, ShardRuntimeState
+from app.services.ws_sharding.persistence_fence import ShardPersistenceFencer
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class ShardSupervisor:
         lease_ttl_seconds: Optional[float] = None,
         session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
         asset_resolver: Optional[AssetRegistryResolver] = None,
+        websocket_client_factory: Optional[Callable] = None,
     ):
         self.worker_id = worker_id or generate_worker_id()
         self.num_shards = num_shards or settings.WS_NUM_SHARDS
@@ -54,6 +56,7 @@ class ShardSupervisor:
         )
         self.session_factory = session_factory
         self.asset_resolver = asset_resolver
+        self.websocket_client_factory = websocket_client_factory
 
         self.lease_manager = lease_manager or ShardLeaseManager(
             lease_ttl_seconds=self.lease_ttl_seconds
@@ -110,6 +113,56 @@ class ShardSupervisor:
             if not claim:
                 return False # Owned by another worker
 
+            # A Redis lease controls liveness, but cannot fence a process that
+            # pauses past its TTL and resumes after a successor.  Before the
+            # runtime is allowed to consume or persist, register this monotonic
+            # ownership generation in PostgreSQL.  Missing migration/database
+            # connectivity is fail-closed: retaining a Redis lease without a
+            # persistence fence would reintroduce split-brain writes.
+            persistence_fencer = None
+            if self.session_factory is not None:
+                try:
+                    persistence_fencer = ShardPersistenceFencer(self.session_factory, claim)
+                    registered = await persistence_fencer.register_claim()
+                except Exception as exc:
+                    logger.exception(
+                        "Unable to register persistence fence for shard %s; releasing Redis lease",
+                        shard_id,
+                        extra={"shard_id": shard_id, "worker_id": self.worker_id},
+                    )
+                    await self.lease_manager.release_shard_lease(shard_id, claim)
+                    return False
+
+                if not registered:
+                    logger.error(
+                        "Rejected stale persistence generation for shard %s (fence=%s); releasing Redis lease",
+                        shard_id,
+                        claim.fencing_token,
+                        extra={"shard_id": shard_id, "worker_id": self.worker_id},
+                    )
+                    await self.lease_manager.release_shard_lease(shard_id, claim)
+                    return False
+
+                # Registration can wait behind an in-flight old write.  Renew
+                # immediately afterwards so a claim that expired while waiting
+                # never starts a runtime merely because its DB row registered.
+                try:
+                    still_owner = await self.lease_manager.renew_shard_lease(
+                        shard_id=shard_id,
+                        claim=claim,
+                        ttl_seconds=self.lease_ttl_seconds,
+                    )
+                except RedisUnavailableError:
+                    still_owner = False
+                if not still_owner:
+                    logger.warning(
+                        "Lease expired while registering persistence fence for shard %s; refusing runtime start",
+                        shard_id,
+                        extra={"shard_id": shard_id, "worker_id": self.worker_id},
+                    )
+                    await self.lease_manager.release_shard_lease(shard_id, claim)
+                    return False
+
             # Filter symbols for this shard
             shard_symbols = get_symbols_for_shard(self.symbols, shard_id, self.num_shards)
 
@@ -120,8 +173,17 @@ class ShardSupervisor:
                 claim=claim,
                 session_factory=self.session_factory,
                 asset_resolver=self.asset_resolver,
+                websocket_client_factory=self.websocket_client_factory,
+                persistence_fencer=persistence_fencer,
             )
-            await runtime.start()
+            try:
+                await runtime.start()
+            except Exception:
+                # Do not leave an acquired ownership lease black-holing a
+                # healthy peer when runtime construction/startup fails.
+                logger.exception("Unable to start runtime for shard %s; releasing Redis lease", shard_id)
+                await self.lease_manager.release_shard_lease(shard_id, claim)
+                return False
 
             # Store active mappings
             self._active_shards[shard_id] = runtime
@@ -182,7 +244,7 @@ class ShardSupervisor:
                         extra={"shard_id": shard_id, "worker_id": self.worker_id, "event": "ownership_lost"}
                     )
                     runtime.fence(reason="Heartbeat renewal returned 0 (lease expired or reclaimed)")
-                    self._cleanup_fenced_shard(shard_id)
+                    await self._cleanup_fenced_shard(shard_id, runtime)
                     break
             except RedisUnavailableError as e:
                 logger.error(
@@ -190,7 +252,7 @@ class ShardSupervisor:
                     extra={"shard_id": shard_id, "worker_id": self.worker_id, "event": "redis_error"}
                 )
                 runtime.fence(reason=f"Redis unavailable during heartbeat: {e}")
-                self._cleanup_fenced_shard(shard_id)
+                await self._cleanup_fenced_shard(shard_id, runtime)
                 break
             except asyncio.CancelledError:
                 break
@@ -200,12 +262,24 @@ class ShardSupervisor:
                     extra={"shard_id": shard_id, "worker_id": self.worker_id, "event": "heartbeat_error"}
                 )
                 runtime.fence(reason=f"Unexpected heartbeat exception: {e}")
-                self._cleanup_fenced_shard(shard_id)
+                await self._cleanup_fenced_shard(shard_id, runtime)
                 break
 
-    def _cleanup_fenced_shard(self, shard_id: int) -> None:
-        """Removes an active claim mapping for a fenced shard."""
+    async def _cleanup_fenced_shard(self, shard_id: int, runtime: ShardRuntime) -> None:
+        """Tear down a fenced runtime before allowing reacquisition.
+
+        The old implementation only dropped the lease claim.  That left the pipeline
+        flusher and a stale runtime referenced while a future acquisition overwrote
+        bookkeeping.  A fenced owner is now fully stopped and removed first.
+        """
         self._active_claims.pop(shard_id, None)
+        if self._active_shards.get(shard_id) is runtime:
+            self._active_shards.pop(shard_id, None)
+        current_task = asyncio.current_task()
+        heartbeat_task = self._heartbeat_tasks.get(shard_id)
+        if heartbeat_task is current_task:
+            self._heartbeat_tasks.pop(shard_id, None)
+        await runtime.stop()
 
     async def start(self) -> None:
         """
@@ -245,8 +319,12 @@ class ShardSupervisor:
                 await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
             self._heartbeat_tasks.clear()
 
-            # 2. Stop all active runtimes
+            # 2. Fence before teardown.  A normal runtime stop flushes its
+            # queue, which can outlive a short Redis TTL and race a successor.
+            # Discarding at most the configured bounded queue is safe because
+            # REST reconciliation repairs it; stale canonical writes are not.
             for shard_id, runtime in list(self._active_shards.items()):
+                runtime.fence(reason="supervisor shutdown")
                 await runtime.stop()
 
             # 3. Safely release all active leases

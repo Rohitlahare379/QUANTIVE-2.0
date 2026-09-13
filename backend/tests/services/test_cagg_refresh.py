@@ -9,6 +9,10 @@ from app.models.cagg_refresh_jobs import CaggRefreshJob, RefreshStatus
 from app.services.cagg_refresh import CaggRefreshService
 from app.core.config import settings
 
+
+# These assertions exercise leases and refresh state against the real schema.
+pytestmark = [pytest.mark.postgres, pytest.mark.timescaledb]
+
 # Test DB Engine and Session Factory
 engine = create_async_engine(settings.sqlalchemy_database_uri, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
@@ -100,24 +104,31 @@ async def test_2_same_session_negative_concurrency():
     use of the same session causes conflicts/errors.
     """
     async with AsyncSessionLocal() as shared_session:
+        started = asyncio.Event()
+
         async def mock_long_query():
-            # Holds connection busy
-            await shared_session.execute(text("SELECT 1"))
-            await asyncio.sleep(0.5)
+            # A server-side sleep keeps the first operation in flight.  Sleeping
+            # after ``SELECT 1`` would release the session and falsely turn this
+            # into a sequential-use test.
+            started.set()
+            return await shared_session.execute(text("SELECT pg_sleep(0.25)"))
 
         async def concurrent_heartbeat_attempt():
-            await asyncio.sleep(0.1)
-            # Attempting transaction or query on same session
-            async with shared_session.begin():
-                await shared_session.execute(text("SELECT 1"))
+            await started.wait()
+            await asyncio.sleep(0.05)
+            return await shared_session.execute(text("SELECT 1"))
 
-        # Concurrent operations on the same session should raise an error or deadlock
-        # Depending on driver state, asyncpg raises InterfaceError: cannot perform operation: another operation is in progress
-        with pytest.raises(Exception):
-            await asyncio.gather(
-                mock_long_query(),
-                concurrent_heartbeat_attempt()
-            )
+        # Do not use ``pytest.raises(Exception)`` around the whole gather: that
+        # would also accept a connection failure before the concurrency race
+        # begins.  The first query must succeed; only the overlapping use must
+        # be rejected.
+        long_result, concurrent_result = await asyncio.gather(
+            mock_long_query(),
+            concurrent_heartbeat_attempt(),
+            return_exceptions=True,
+        )
+        assert not isinstance(long_result, Exception)
+        assert isinstance(concurrent_result, Exception)
 
 
 @pytest.mark.asyncio

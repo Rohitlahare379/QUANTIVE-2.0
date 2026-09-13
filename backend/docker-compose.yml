@@ -1,38 +1,125 @@
-version: '3.8'
+# This compose definition is deliberately safe as a deployment baseline:
+# PostgreSQL, Redis, MinIO, and the MinIO console are private to the Compose
+# network; only the API is bound to localhost by default. Do not add public
+# database/cache ports or default credentials here. Operators can provide a
+# separate, reviewed override for local debugging when needed.
+
+x-runtime-environment: &runtime-environment
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  POSTGRES_SERVER: db
+  POSTGRES_USER: ${POSTGRES_USER:-quantive}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+  POSTGRES_DB: ${POSTGRES_DB:-quantive}
+  POSTGRES_PORT: "5432"
+  REDIS_URL: ${REDIS_URL:?REDIS_URL must be an authenticated internal Redis URL}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID must be set}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY must be set}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+  S3_EXPORT_BUCKET: ${S3_EXPORT_BUCKET:-quantive-exports}
+  API_KEY_PEPPER: ${API_KEY_PEPPER:?API_KEY_PEPPER must be set}
 
 services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     build: .
     ports:
-      - "8000:8000"
-    environment:
-      - POSTGRES_SERVER=db
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=quantive
-      - POSTGRES_PORT=5432
+      - "${QUANTIVE_API_BIND_ADDRESS:-127.0.0.1}:8000:8000"
+    environment: *runtime-environment
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-2}
+    healthcheck:
+      # A process can be live while its database or Redis lease store is down.
+      # Route traffic only after the dependency-backed readiness check succeeds.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  migrate:
+    build: .
+    environment: *runtime-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+
+  worker:
+    build: .
+    environment: *runtime-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: dramatiq app.workers.tasks app.workers.gap_repair app.workers.cagg_refresh app.workers.historical_merge app.workers.export app.workers.live_strategy app.workers.strategy_comparison app.workers.strategy_monitoring --processes ${DRAMATIQ_PROCESSES:-1} --threads ${DRAMATIQ_CONCURRENCY:-8}
+
+  maintenance:
+    build: .
+    environment: *runtime-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.workers.maintenance
+
+  ws_supervisor:
+    build: .
+    environment: *runtime-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.workers.ws_sharding
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+    expose:
+      - "9000"
+      - "9001"
     volumes:
-      - .:/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - minio_data:/data
 
   db:
-    image: timescale/timescaledb:latest-pg16
+    image: timescale/timescaledb:2.17.2-pg16
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=quantive
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-quantive}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-quantive}
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d quantive"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 5s
       retries: 5
 
 volumes:
   postgres_data:
+  minio_data:

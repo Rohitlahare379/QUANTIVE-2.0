@@ -10,7 +10,7 @@ import logging
 import os
 import socket
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
@@ -20,26 +20,46 @@ from app.workers.config import get_async_redis
 
 logger = logging.getLogger(__name__)
 
-# Atomic Heartbeat Renewal Lua Script
-# Verifies the stored payload matches ARGV[1] before extending TTL via PEXPIRE.
-# Returns 1 if renewed, 0 if ownership lost / key missing / owned by another claim.
-RENEW_LEASE_LUA = """
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
-else
+# Atomic acquire gives every successful ownership generation a monotonically
+# increasing fencing token.  Redis TTLs decide *liveness*, but they cannot
+# stop a paused owner that resumes after another worker has acquired the same
+# shard.  The token is registered with PostgreSQL before a runtime starts and
+# is checked in the same transaction as candle persistence.
+ACQUIRE_LEASE_LUA = """
+if redis.call("EXISTS", KEYS[1]) == 1 then
     return 0
 end
+local fencing_token = redis.call("INCR", KEYS[2])
+local claim = cjson.decode(ARGV[1])
+claim["fencing_token"] = fencing_token
+redis.call("SET", KEYS[1], cjson.encode(claim), "PX", ARGV[2])
+return fencing_token
 """
 
-# Atomic Safe Release Lua Script
-# Only deletes the key if the current stored payload exactly matches ARGV[1].
-# Prevents stale workers from deleting a newly acquired lease of another worker.
-RELEASE_LEASE_LUA = """
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("DEL", KEYS[1])
-else
-    return 0
+# Atomic heartbeat renewal verifies the immutable acquisition identity instead
+# of comparing a raw JSON payload (Lua JSON key ordering is not stable).
+RENEW_LEASE_LUA = """
+local raw = redis.call("GET", KEYS[1])
+if raw == false then return 0 end
+local claim = cjson.decode(raw)
+if claim["claim_token"] == ARGV[1]
+   and tonumber(claim["fencing_token"]) == tonumber(ARGV[2]) then
+    return redis.call("PEXPIRE", KEYS[1], ARGV[3])
 end
+return 0
+"""
+
+# Atomic release uses the same ownership generation predicate.  A stale owner
+# must never delete a later owner after lease expiry/reacquisition.
+RELEASE_LEASE_LUA = """
+local raw = redis.call("GET", KEYS[1])
+if raw == false then return 0 end
+local claim = cjson.decode(raw)
+if claim["claim_token"] == ARGV[1]
+   and tonumber(claim["fencing_token"]) == tonumber(ARGV[2]) then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
 """
 
 
@@ -69,6 +89,10 @@ class ShardLeaseClaim:
     claim_token: str
     claimed_at: datetime
     lease_expires_at: datetime
+    # A Redis-monotonic ownership generation.  ``0`` preserves backward
+    # compatibility for hand-built test claims, but those claims cannot enter
+    # a persistence-fenced production runtime.
+    fencing_token: int = 0
 
     def to_json(self) -> str:
         """Serializes the lease claim to a deterministic JSON string."""
@@ -78,6 +102,7 @@ class ShardLeaseClaim:
             "claim_token": self.claim_token,
             "claimed_at": self.claimed_at.isoformat(),
             "lease_expires_at": self.lease_expires_at.isoformat(),
+            "fencing_token": self.fencing_token,
         }
         return json.dumps(data, sort_keys=True)
 
@@ -91,6 +116,7 @@ class ShardLeaseClaim:
             claim_token=str(data["claim_token"]),
             claimed_at=datetime.fromisoformat(data["claimed_at"]),
             lease_expires_at=datetime.fromisoformat(data["lease_expires_at"]),
+            fencing_token=int(data.get("fencing_token", 0)),
         )
 
 
@@ -110,11 +136,16 @@ class ShardLeaseManager:
         self.lease_ttl_seconds = lease_ttl_seconds or settings.WS_LEASE_TTL_SECONDS
         
         # Pre-register Lua scripts for atomic operations
+        self._acquire_script = self.redis.register_script(ACQUIRE_LEASE_LUA)
         self._renew_script = self.redis.register_script(RENEW_LEASE_LUA)
         self._release_script = self.redis.register_script(RELEASE_LEASE_LUA)
 
     def _get_key(self, shard_id: int) -> str:
         return f"{self.key_prefix}:{shard_id}"
+
+    def _get_fencing_key(self, shard_id: int) -> str:
+        """Return the durable Redis counter key for a shard generation."""
+        return f"{self.key_prefix}:fence:{shard_id}"
 
     async def acquire_shard_lease(
         self,
@@ -123,7 +154,7 @@ class ShardLeaseManager:
         ttl_seconds: Optional[float] = None
     ) -> Optional[ShardLeaseClaim]:
         """
-        Attempts atomic acquisition of a shard lease using Redis SET NX EX.
+        Attempts atomic acquisition of a shard lease and fencing generation.
 
         Returns:
             ShardLeaseClaim if acquired, None if the shard is currently owned by another worker.
@@ -139,25 +170,38 @@ class ShardLeaseManager:
         claim_token = uuid.uuid4().hex
         expires_at = now + timedelta(seconds=ttl)
         
-        claim = ShardLeaseClaim(
+        # Lua adds the fencing token after atomically confirming the lease key
+        # is free.  Do not increment it speculatively for unsuccessful claims:
+        # a generation represents an actual owner, not contention.
+        provisional_claim = ShardLeaseClaim(
             shard_id=shard_id,
             worker_id=worker_id,
             claim_token=claim_token,
             claimed_at=now,
             lease_expires_at=expires_at,
         )
-        payload = claim.to_json()
 
         try:
-            # SET key payload PX ttl_ms NX -> atomic acquire with millisecond precision
-            acquired = await self.redis.set(key, payload, px=ttl_ms, nx=True)
-            if acquired:
+            fencing_token = await self._acquire_script(
+                keys=[key, self._get_fencing_key(shard_id)],
+                args=[provisional_claim.to_json(), ttl_ms],
+            )
+            if fencing_token:
+                claim = ShardLeaseClaim(
+                    shard_id=shard_id,
+                    worker_id=worker_id,
+                    claim_token=claim_token,
+                    claimed_at=now,
+                    lease_expires_at=expires_at,
+                    fencing_token=int(fencing_token),
+                )
                 logger.info(
-                    f"Successfully acquired lease for shard {shard_id} (claim: {claim_token}) by worker {worker_id}",
+                    f"Successfully acquired lease for shard {shard_id} (claim: {claim_token}, fence: {claim.fencing_token}) by worker {worker_id}",
                     extra={
                         "shard_id": shard_id,
                         "worker_id": worker_id,
                         "claim_token": claim_token,
+                        "fencing_token": claim.fencing_token,
                         "event": "shard_acquired"
                     }
                 )
@@ -197,12 +241,10 @@ class ShardLeaseManager:
         ttl = ttl_seconds or self.lease_ttl_seconds
         ttl_ms = int(ttl * 1000)
         key = self._get_key(shard_id)
-        payload = claim.to_json()
-
         try:
             result = await self._renew_script(
                 keys=[key],
-                args=[payload, ttl_ms]
+                args=[claim.claim_token, claim.fencing_token, ttl_ms]
             )
             renewed = bool(result == 1)
             if renewed:
@@ -250,12 +292,10 @@ class ShardLeaseManager:
             bool: True if the key was deleted, False if already deleted/expired or claimed by another worker.
         """
         key = self._get_key(shard_id)
-        payload = claim.to_json()
-
         try:
             result = await self._release_script(
                 keys=[key],
-                args=[payload]
+                args=[claim.claim_token, claim.fencing_token]
             )
             released = bool(result == 1)
             if released:

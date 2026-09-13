@@ -16,6 +16,11 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
+    # TimescaleDB must be enabled before creating the hypertable below.  The image
+    # supplies the extension binaries but does not make it available in every fresh
+    # database automatically.
+    op.execute('CREATE EXTENSION IF NOT EXISTS timescaledb;')
+
     # 1. Create asset_registry
     op.create_table(
         'asset_registry',

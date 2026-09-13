@@ -567,6 +567,8 @@ async def test_shutdown_state_f_ownership_loss_during_shutdown():
 # ============================================================================
 
 @pytest.mark.asyncio
+@pytest.mark.postgres
+@pytest.mark.timescaledb
 async def test_market_anomaly_out_of_order_duplicate_late_arrival():
     """
     Tests exact anomalies on real PostgreSQL:
@@ -636,6 +638,8 @@ async def test_market_anomaly_out_of_order_duplicate_late_arrival():
 # ============================================================================
 
 @pytest.mark.asyncio
+@pytest.mark.postgres
+@pytest.mark.timescaledb
 async def test_real_postgresql_persistence_benchmark():
     """
     Measures genuine persistence throughput against the local PostgreSQL database:
