@@ -32,7 +32,7 @@ from app.models.gap_repair_jobs import GapRepairJob, GapRepairStatus
 from app.models.cagg_refresh_jobs import CaggRefreshJob, RefreshStatus
 from app.services.gap_repair import GapRepairService, classify_error
 from app.services.ingestion import IngestionService
-from app.services.cagg_refresh import compute_cagg_bucket_alignment
+from app.services.cagg_refresh import compute_cagg_bucket_alignment, schedule_cagg_refresh_jobs
 from app.services.ws_sharding.pipeline import BoundedLiveIngestionPipeline
 from app.services.ws_sharding.registry import AssetRegistryResolver
 
@@ -200,7 +200,7 @@ async def test_section_3_partial_repair_failure():
     mock_client.get_klines = mock_streaming_klines
 
     call_count = 0
-    orig_commit = IngestionService._commit_batch
+    orig_commit = IngestionService.commit_batch_in_transaction
 
     async def patched_commit(self_ing, a_id, batch):
         nonlocal call_count
@@ -212,9 +212,11 @@ async def test_section_3_partial_repair_failure():
             # Batch 2 fails with DB error
             raise RuntimeError("Simulated PostgreSQL connection drop during batch 2")
 
-    with patch.object(IngestionService, "_commit_batch", new=patched_commit):
-        with pytest.raises(Exception):
-            await service.process_next_job(worker_id="worker-s3", binance_client=mock_client, batch_size=30)
+    with patch.object(IngestionService, "commit_batch_in_transaction", new=patched_commit):
+        with pytest.raises(RuntimeError, match="Simulated PostgreSQL connection drop"):
+            await service.process_next_job(
+                worker_id="worker-s3", binance_client=mock_client, batch_size=30
+            )
 
     # Verify:
     async with AsyncSessionLocal() as session:
@@ -380,11 +382,11 @@ async def test_section_5_overlapping_repair_jobs():
                 yield c
         mock_a.get_klines = stream_a
         await service._execute_reconciliation(asset_id, "BTCUSDT", t_10_00, t_11_00, binance_client=mock_a, batch_size=20)
-        # Schedule CAGG
-        al_st, al_et = compute_cagg_bucket_alignment(t_10_00, t_11_00)
+        # Schedule through the coalescing scheduler rather than bypassing its
+        # exclusion-constraint invariant with direct duplicate inserts.
         async with AsyncSessionLocal() as s:
-            s.add(CaggRefreshJob(window_start=al_st, window_end=al_et, status=RefreshStatus.PENDING))
-            await s.commit()
+            async with s.begin():
+                await schedule_cagg_refresh_jobs(s, t_10_00, t_11_00)
 
     async def execute_job_b():
         mock_b = AsyncMock()
@@ -393,11 +395,9 @@ async def test_section_5_overlapping_repair_jobs():
                 yield c
         mock_b.get_klines = stream_b
         await service._execute_reconciliation(asset_id, "BTCUSDT", t_10_30, t_11_30, binance_client=mock_b, batch_size=20)
-        # Schedule CAGG
-        al_st, al_et = compute_cagg_bucket_alignment(t_10_30, t_11_30)
         async with AsyncSessionLocal() as s:
-            s.add(CaggRefreshJob(window_start=al_st, window_end=al_et, status=RefreshStatus.PENDING))
-            await s.commit()
+            async with s.begin():
+                await schedule_cagg_refresh_jobs(s, t_10_30, t_11_30)
 
     await asyncio.gather(execute_job_a(), execute_job_b())
 
@@ -414,7 +414,7 @@ async def test_section_5_overlapping_repair_jobs():
 
         # CAGG refresh jobs scheduled
         cagg_jobs = (await session.execute(select(CaggRefreshJob))).scalars().all()
-        assert len(cagg_jobs) >= 2
+        assert len(cagg_jobs) == 1
 
 
 # =========================================================================
@@ -534,6 +534,25 @@ async def test_section_12_complex_gap_merging():
     """
     asset_id = await _create_test_asset("ETHUSDT")
     base = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+
+    # Coverage metadata must only be asserted after canonical raw persistence.
+    # Seed the rows directly without creating metadata so each merge below
+    # exercises exactly the intended range operation.
+    candles = [
+        {
+            "asset_id": asset_id,
+            "timestamp": base + timedelta(minutes=minute),
+            "open": 50000.0,
+            "high": 50100.0,
+            "low": 49900.0,
+            "close": 50050.0,
+            "volume": 10.0,
+        }
+        for minute in range(41)
+    ]
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            await IngestionService(session).insert_candle_batch(candles, target_model=Raw1mCandle)
 
     # 1. Add [10:00, 10:10]
     async with AsyncSessionLocal() as session:

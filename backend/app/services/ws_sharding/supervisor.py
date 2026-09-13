@@ -12,7 +12,12 @@ from typing import Callable, Dict, List, Optional, Set
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import settings
-from app.services.ws_sharding.assignment import get_symbols_for_shard
+from app.services.ws_sharding.assignment import (
+    ShardCapacityError,
+    get_symbols_for_shard,
+    normalize_symbol,
+    required_shard_count,
+)
 from app.services.ws_sharding.lease import (
     RedisUnavailableError,
     ShardLeaseClaim,
@@ -45,11 +50,30 @@ class ShardSupervisor:
         websocket_client_factory: Optional[Callable] = None,
     ):
         self.worker_id = worker_id or generate_worker_id()
+        self.symbols = sorted({normalize_symbol(symbol) for symbol in (symbols or [])})
         self.num_shards = num_shards or settings.WS_NUM_SHARDS
+        required = required_shard_count(
+            self.symbols,
+            max_streams_per_shard=settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION,
+            minimum_shards=1,
+        )
+        # Shard identifiers are a distributed lease namespace.  Silently
+        # changing their count when a process observes a newer asset snapshot
+        # would remap existing symbols and allow two owners to ingest one
+        # stream.  Capacity is therefore fail-closed: scale the shared
+        # WS_NUM_SHARDS configuration consistently across supervisors first.
+        if required > self.num_shards:
+            raise ShardCapacityError(
+                f"{len(self.symbols)} streams require at least {required} shared shards at "
+                f"{settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION} streams per shard; "
+                f"WS_NUM_SHARDS is {self.num_shards}"
+            )
         self.candidate_shards = (
             sorted(candidate_shards) if candidate_shards is not None else list(range(self.num_shards))
         )
-        self.symbols = symbols or []
+        invalid_candidates = [shard for shard in self.candidate_shards if shard < 0 or shard >= self.num_shards]
+        if invalid_candidates:
+            raise ValueError(f"candidate shards outside capacity-safe range: {invalid_candidates}")
         self.lease_ttl_seconds = lease_ttl_seconds or settings.WS_LEASE_TTL_SECONDS
         self.heartbeat_interval_seconds = (
             heartbeat_interval_seconds or settings.WS_HEARTBEAT_INTERVAL_SECONDS
@@ -164,7 +188,12 @@ class ShardSupervisor:
                     return False
 
             # Filter symbols for this shard
-            shard_symbols = get_symbols_for_shard(self.symbols, shard_id, self.num_shards)
+            shard_symbols = get_symbols_for_shard(
+                self.symbols,
+                shard_id,
+                self.num_shards,
+                max_streams_per_shard=settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION,
+            )
 
             # Instantiate and start ShardRuntime
             runtime = ShardRuntime(

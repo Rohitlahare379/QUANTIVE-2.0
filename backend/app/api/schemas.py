@@ -18,3 +18,4 @@ class SyncRangeResponse(BaseModel):
 class SyncStatusResponse(BaseModel):
     asset_id: int
     synced_ranges: List[SyncRangeResponse]
+    next_offset: Optional[int] = None

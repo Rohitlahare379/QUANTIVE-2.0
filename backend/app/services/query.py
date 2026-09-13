@@ -47,8 +47,22 @@ class AssetQueryService:
             "is_active": asset.is_active
         }
 
-    async def list_assets(self) -> List[Dict[str, Any]]:
-        assets = await self.repo.list_assets()
+    async def list_assets(
+        self,
+        *,
+        exchange: str | None = None,
+        asset_type: str | None = None,
+        active_only: bool = True,
+        limit: int,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        assets = await self.repo.list_assets(
+            exchange=exchange,
+            asset_type=asset_type,
+            active_only=active_only,
+            limit=limit,
+            offset=offset,
+        )
         return [
             {
                 "id": asset.id,

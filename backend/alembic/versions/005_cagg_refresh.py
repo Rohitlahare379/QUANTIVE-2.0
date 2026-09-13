@@ -17,8 +17,11 @@ depends_on = None
 
 def upgrade() -> None:
     # Create Enum
-    refresh_status = postgresql.ENUM('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', name='refreshstatus')
-    refresh_status.create(op.get_bind())
+    refresh_status = postgresql.ENUM(
+        'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED',
+        name='refreshstatus', create_type=False,
+    )
+    refresh_status.create(op.get_bind(), checkfirst=True)
     
     op.create_table('cagg_refresh_jobs',
         sa.Column('id', sa.Integer(), nullable=False),
@@ -38,5 +41,8 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_cagg_refresh_jobs_id'), table_name='cagg_refresh_jobs')
     op.drop_table('cagg_refresh_jobs')
     
-    refresh_status = postgresql.ENUM('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', name='refreshstatus')
-    refresh_status.drop(op.get_bind())
+    refresh_status = postgresql.ENUM(
+        'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED',
+        name='refreshstatus', create_type=False,
+    )
+    refresh_status.drop(op.get_bind(), checkfirst=True)

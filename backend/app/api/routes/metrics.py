@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from fastapi import APIRouter
 from fastapi.responses import PlainTextResponse
 from prometheus_client import generate_latest, Gauge, CONTENT_TYPE_LATEST
@@ -33,6 +34,29 @@ CAGG_REFRESH_PENDING_JOBS = Gauge(
 CAGG_REFRESH_FAILED_JOBS = Gauge(
     'cagg_refresh_failed_jobs',
     'Total number of CAGG refresh jobs that have failed'
+)
+
+CANONICAL_INGESTION_LAST_RECEIVED_UNIX = Gauge(
+    "quantive_canonical_ingestion_last_received_timestamp_seconds",
+    "Unix timestamp of the most recently received canonical raw candle",
+)
+WS_PERSISTENCE_FENCE_SHARDS = Gauge(
+    "quantive_ws_persistence_fence_shards",
+    "Number of WebSocket shards with a durable PostgreSQL persistence fence",
+)
+WS_PERSISTENCE_FENCE_MAX_GENERATION = Gauge(
+    "quantive_ws_persistence_fence_max_generation",
+    "Highest durable WebSocket persistence fencing generation",
+)
+DURABLE_WORKFLOW_JOBS = Gauge(
+    "quantive_durable_workflow_jobs",
+    "Durable workflow jobs grouped by workflow and persisted state",
+    ["workflow", "status"],
+)
+DURABLE_WORKFLOW_EXPIRED_LEASES = Gauge(
+    "quantive_durable_workflow_expired_leases",
+    "Processing durable workflow jobs whose persisted lease has expired",
+    ["workflow"],
 )
 
 # A scrape that silently returns the previous successful values when a
@@ -68,6 +92,72 @@ async def _collect_cagg_metrics() -> bool:
         return True
     except Exception:
         logger.exception("Unable to collect CAGG refresh metrics")
+        return False
+
+
+async def _collect_durable_data_metrics() -> bool:
+    """Export database-backed freshness, fencing, backlog, and lease health.
+
+    These metrics are intentionally derived from canonical tables and durable
+    job state, rather than process-local worker counters, so an API replica can
+    expose them after a worker restart.  The separate WebSocket worker gauges
+    report instantaneous queue pressure.
+    """
+    from sqlalchemy import func, select
+    from app.db.session import async_session_maker
+    from app.models.raw_1m_candles import Raw1mCandle
+    from app.models.ws_shard_persistence_fence import WsShardPersistenceFence
+    from app.models.gap_repair_jobs import GapRepairJob, GapRepairStatus
+    from app.models.cagg_refresh_jobs import CaggRefreshJob, RefreshStatus
+    from app.models.historical_merge_jobs import HistoricalMergeJob, HistoricalMergeStatus
+
+    workflows = (
+        ("gap_repair", GapRepairJob, GapRepairJob.status, tuple(GapRepairStatus), GapRepairStatus.PROCESSING),
+        ("cagg_refresh", CaggRefreshJob, CaggRefreshJob.status, tuple(RefreshStatus), RefreshStatus.PROCESSING),
+        (
+            "historical_merge",
+            HistoricalMergeJob,
+            HistoricalMergeJob.status,
+            tuple(HistoricalMergeStatus),
+            HistoricalMergeStatus.PROCESSING,
+        ),
+    )
+    try:
+        async with async_session_maker() as session:
+            latest_received = await session.scalar(select(func.max(Raw1mCandle.source_received_at)))
+            fence_count, max_generation = (
+                await session.execute(
+                    select(func.count(WsShardPersistenceFence.shard_id), func.max(WsShardPersistenceFence.fencing_token))
+                )
+            ).one()
+            for workflow, model, status_column, statuses, processing_status in workflows:
+                rows = (
+                    await session.execute(
+                        select(status_column, func.count(model.id)).group_by(status_column)
+                    )
+                ).all()
+                counts = {status: count for status, count in rows}
+                for status_value in statuses:
+                    DURABLE_WORKFLOW_JOBS.labels(workflow=workflow, status=status_value.value).set(
+                        counts.get(status_value, 0)
+                    )
+                expired = await session.scalar(
+                    select(func.count(model.id)).where(
+                        status_column == processing_status,
+                        model.lease_expires_at.is_not(None),
+                        model.lease_expires_at < datetime.now(timezone.utc),
+                    )
+                )
+                DURABLE_WORKFLOW_EXPIRED_LEASES.labels(workflow=workflow).set(expired or 0)
+
+        CANONICAL_INGESTION_LAST_RECEIVED_UNIX.set(
+            latest_received.timestamp() if latest_received is not None else 0
+        )
+        WS_PERSISTENCE_FENCE_SHARDS.set(fence_count or 0)
+        WS_PERSISTENCE_FENCE_MAX_GENERATION.set(max_generation or 0)
+        return True
+    except Exception:
+        logger.exception("Unable to collect durable data-foundation metrics")
         return False
 
 
@@ -133,7 +223,9 @@ async def get_metrics():
     Exposes Prometheus metrics including Dramatiq Dead Letter Queue introspection.
     Operates in O(1) or bounded O(N) where N is DLQ size, ensuring no Redis exhaustion.
     """
-    database_up = await _collect_cagg_metrics()
+    cagg_metrics_up = await _collect_cagg_metrics()
+    durable_metrics_up = await _collect_durable_data_metrics()
+    database_up = cagg_metrics_up and durable_metrics_up
     redis_up = await _collect_dlq_metrics()
     METRICS_DEPENDENCY_UP.labels(dependency="database").set(1 if database_up else 0)
     METRICS_DEPENDENCY_UP.labels(dependency="redis").set(1 if redis_up else 0)

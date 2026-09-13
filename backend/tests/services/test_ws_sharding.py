@@ -25,12 +25,15 @@ import fakeredis.aioredis
 import pytest
 import pytest_asyncio
 from unittest.mock import MagicMock
+from prometheus_client import generate_latest
 
 from app.services.ws_sharding.assignment import (
+    ShardCapacityError,
     assign_symbols_to_shards,
     get_shard_for_symbol,
     get_symbols_for_shard,
     normalize_symbol,
+    required_shard_count,
 )
 from app.services.ws_sharding.lease import (
     RedisUnavailableError,
@@ -40,6 +43,7 @@ from app.services.ws_sharding.lease import (
 )
 from app.services.ws_sharding.runtime import ShardRuntime, ShardRuntimeState
 from app.services.ws_sharding.supervisor import ShardSupervisor
+from app.services.ws_sharding.metrics import PipelineMetrics, publish_pipeline_metrics, record_pipeline_outcome
 
 
 @pytest_asyncio.fixture
@@ -102,6 +106,57 @@ def test_3_different_symbols_distribute_reasonably():
     for shard_id in range(num_shards):
         filtered = get_symbols_for_shard(test_symbols, shard_id, num_shards=num_shards)
         assert filtered == distribution[shard_id]
+
+
+def test_capacity_aware_assignment_never_exceeds_configured_connection_limit():
+    """Overflow must be deterministically spread rather than sent to Binance."""
+    symbols = [f"CAPACITY{i:04d}USDT" for i in range(1_025)]
+
+    assert required_shard_count(symbols, max_streams_per_shard=1_024, minimum_shards=1) == 2
+    with pytest.raises(ShardCapacityError, match="require at least 2 shards"):
+        assign_symbols_to_shards(symbols, num_shards=1, max_streams_per_shard=1_024)
+
+    assignment = assign_symbols_to_shards(symbols, num_shards=2, max_streams_per_shard=1_024)
+    repeated = assign_symbols_to_shards(reversed(symbols), num_shards=2, max_streams_per_shard=1_024)
+    assert assignment == repeated
+    assert sum(map(len, assignment.values())) == len(symbols)
+    assert all(len(streams) <= 1_024 for streams in assignment.values())
+
+
+def test_supervisor_rejects_a_topology_without_shared_capacity():
+    symbols = [f"SUPERVISOR{i:04d}USDT" for i in range(1_025)]
+    with pytest.raises(ShardCapacityError, match="require at least 2 shared shards"):
+        ShardSupervisor(
+            worker_id="capacity-test",
+            num_shards=1,
+            symbols=symbols,
+            lease_manager=MagicMock(),
+        )
+
+    supervisor = ShardSupervisor(
+        worker_id="capacity-test",
+        num_shards=2,
+        symbols=symbols,
+        lease_manager=MagicMock(),
+    )
+
+    assert supervisor.num_shards == 2
+    assert supervisor.candidate_shards == [0, 1]
+    assert all(
+        len(get_symbols_for_shard(symbols, shard_id, supervisor.num_shards)) <= 1_024
+        for shard_id in supervisor.candidate_shards
+    )
+
+
+def test_pipeline_queue_pressure_and_fencing_metrics_are_exported():
+    metrics = PipelineMetrics(queue_size=90, queue_utilization_ratio=0.9, is_degraded=True)
+    publish_pipeline_metrics(991, metrics)
+    record_pipeline_outcome(991, "discarded_fenced", 2)
+
+    payload = generate_latest()
+    assert b'quantive_ws_pipeline_queue_depth{shard_id="991"} 90.0' in payload
+    assert b'quantive_ws_pipeline_degraded{shard_id="991"} 1.0' in payload
+    assert b'quantive_ws_pipeline_events_total{outcome="discarded_fenced",shard_id="991"} 2.0' in payload
 
 
 # ============================================================================

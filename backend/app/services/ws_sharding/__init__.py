@@ -7,6 +7,8 @@ from app.services.ws_sharding.assignment import (
     get_shard_for_symbol,
     get_symbols_for_shard,
     normalize_symbol,
+    required_shard_count,
+    ShardCapacityError,
 )
 from app.services.ws_sharding.lease import (
     RedisUnavailableError,
@@ -42,6 +44,8 @@ __all__ = [
     "get_shard_for_symbol",
     "get_symbols_for_shard",
     "normalize_symbol",
+    "required_shard_count",
+    "ShardCapacityError",
     "generate_worker_id",
     "RedisUnavailableError",
     "ShardLeaseClaim",

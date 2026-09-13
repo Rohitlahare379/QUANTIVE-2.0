@@ -19,8 +19,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 5m Aggregate
-    op.execute("""
+    # Timescale creates continuous aggregates using CREATE MATERIALIZED VIEW.
+    # PostgreSQL prohibits that statement inside a transaction, while Alembic
+    # normally wraps a revision in one.  Keep the whole CAGG/policy sequence
+    # in Alembic's explicit autocommit block so a fresh database can reach head.
+    with op.get_context().autocommit_block():
+        # 5m Aggregate
+        op.execute("""
     CREATE MATERIALIZED VIEW candles_5m
     WITH (timescaledb.continuous) AS
     SELECT
@@ -33,11 +38,11 @@ def upgrade() -> None:
         sum(volume) AS volume
     FROM raw_1m_candles
     GROUP BY asset_id, time_bucket('5 minutes', timestamp);
-    """)
-    op.execute("SELECT add_continuous_aggregate_policy('candles_5m', start_offset => NULL, end_offset => INTERVAL '1 min', schedule_interval => INTERVAL '1 min');")
+        """)
+        op.execute("SELECT add_continuous_aggregate_policy('candles_5m', start_offset => NULL, end_offset => INTERVAL '1 min', schedule_interval => INTERVAL '1 min');")
 
-    # 15m Aggregate
-    op.execute("""
+        # 15m Aggregate
+        op.execute("""
     CREATE MATERIALIZED VIEW candles_15m
     WITH (timescaledb.continuous) AS
     SELECT
@@ -50,11 +55,11 @@ def upgrade() -> None:
         sum(volume) AS volume
     FROM raw_1m_candles
     GROUP BY asset_id, time_bucket('15 minutes', timestamp);
-    """)
-    op.execute("SELECT add_continuous_aggregate_policy('candles_15m', start_offset => NULL, end_offset => INTERVAL '1 min', schedule_interval => INTERVAL '5 min');")
+        """)
+        op.execute("SELECT add_continuous_aggregate_policy('candles_15m', start_offset => NULL, end_offset => INTERVAL '1 min', schedule_interval => INTERVAL '5 min');")
 
-    # 1h Aggregate
-    op.execute("""
+        # 1h Aggregate
+        op.execute("""
     CREATE MATERIALIZED VIEW candles_1h
     WITH (timescaledb.continuous) AS
     SELECT
@@ -67,11 +72,11 @@ def upgrade() -> None:
         sum(volume) AS volume
     FROM raw_1m_candles
     GROUP BY asset_id, time_bucket('1 hour', timestamp);
-    """)
-    op.execute("SELECT add_continuous_aggregate_policy('candles_1h', start_offset => NULL, end_offset => INTERVAL '1 hour', schedule_interval => INTERVAL '15 min');")
+        """)
+        op.execute("SELECT add_continuous_aggregate_policy('candles_1h', start_offset => NULL, end_offset => INTERVAL '1 hour', schedule_interval => INTERVAL '15 min');")
 
-    # 4h Aggregate
-    op.execute("""
+        # 4h Aggregate
+        op.execute("""
     CREATE MATERIALIZED VIEW candles_4h
     WITH (timescaledb.continuous) AS
     SELECT
@@ -84,11 +89,11 @@ def upgrade() -> None:
         sum(volume) AS volume
     FROM raw_1m_candles
     GROUP BY asset_id, time_bucket('4 hours', timestamp);
-    """)
-    op.execute("SELECT add_continuous_aggregate_policy('candles_4h', start_offset => NULL, end_offset => INTERVAL '4 hours', schedule_interval => INTERVAL '1 hour');")
+        """)
+        op.execute("SELECT add_continuous_aggregate_policy('candles_4h', start_offset => NULL, end_offset => INTERVAL '4 hours', schedule_interval => INTERVAL '1 hour');")
 
-    # 1d Aggregate
-    op.execute("""
+        # 1d Aggregate
+        op.execute("""
     CREATE MATERIALIZED VIEW candles_1d
     WITH (timescaledb.continuous) AS
     SELECT
@@ -101,8 +106,8 @@ def upgrade() -> None:
         sum(volume) AS volume
     FROM raw_1m_candles
     GROUP BY asset_id, time_bucket('1 day', timestamp);
-    """)
-    op.execute("SELECT add_continuous_aggregate_policy('candles_1d', start_offset => NULL, end_offset => INTERVAL '1 day', schedule_interval => INTERVAL '4 hours');")
+        """)
+        op.execute("SELECT add_continuous_aggregate_policy('candles_1d', start_offset => NULL, end_offset => INTERVAL '1 day', schedule_interval => INTERVAL '4 hours');")
 
 
 def downgrade() -> None:

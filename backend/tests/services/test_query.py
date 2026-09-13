@@ -69,6 +69,25 @@ async def test_get_asset_not_found(mock_db, mock_asset_repo):
     with pytest.raises(AssetNotFoundError):
         await service.get_asset_by_symbol("INVALID")
 
+
+@pytest.mark.asyncio
+async def test_list_assets_passes_filters_and_pagination_to_repository(mock_db, mock_asset_repo):
+    asset = MagicMock(id=1, symbol="BTCUSDT", exchange="BINANCE", asset_type="SPOT", is_active=True)
+    mock_asset_repo.list_assets.return_value = [asset]
+
+    result = await AssetQueryService(mock_db).list_assets(
+        exchange="BINANCE",
+        asset_type="SPOT",
+        active_only=True,
+        limit=25,
+        offset=50,
+    )
+
+    assert result == [{"id": 1, "symbol": "BTCUSDT", "exchange": "BINANCE", "asset_type": "SPOT", "is_active": True}]
+    mock_asset_repo.list_assets.assert_awaited_once_with(
+        exchange="BINANCE", asset_type="SPOT", active_only=True, limit=25, offset=50
+    )
+
 @pytest.mark.asyncio
 async def test_timeframe_routing_invalid(mock_db):
     service = CandleQueryService(mock_db)

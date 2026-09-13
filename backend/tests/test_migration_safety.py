@@ -92,3 +92,55 @@ def test_websocket_shard_persistence_fence_migration_is_present_after_sync_range
     assert create in sql
     assert "fencing_token BIGINT NOT NULL" in sql
     assert "ck_ws_shard_persistence_fence_positive CHECK (fencing_token > 0)" in sql
+
+
+def test_continuous_aggregate_migration_commits_before_creating_materialized_views():
+    """Timescale rejects continuous aggregates inside Alembic's DDL transaction."""
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
+        cwd=BACKEND_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    sql = result.stdout
+    cagg_position = sql.index("CREATE MATERIALIZED VIEW candles_5m")
+    assert sql.rindex("COMMIT;", 0, cagg_position) < cagg_position
+
+
+def test_explicitly_created_postgresql_enums_are_not_created_again_by_table_ddl():
+    """Named enums created in a migration need create_type=False on table columns."""
+    for revision in ("005_cagg_refresh.py", "006_export_jobs.py"):
+        contents = (BACKEND_ROOT / "alembic" / "versions" / revision).read_text()
+        assert "create_type=False" in contents
+
+
+def test_raw_integrity_constraints_disable_timescale_compression_during_schema_change():
+    """Timescale rejects adding raw-table constraints while compression is enabled."""
+    contents = (
+        BACKEND_ROOT / "alembic" / "versions" / "014_data_integrity_hardening.py"
+    ).read_text()
+    disabled = "ALTER TABLE raw_1m_candles SET (timescaledb.compress = false)"
+    constraints = "_add_integrity_constraints(table_name)"
+    restore_call = "    _restore_raw_compression()"
+    assert contents.index(disabled) < contents.rindex(constraints) < contents.index(restore_call)
+
+
+def test_alembic_version_column_is_widened_before_the_first_long_revision_id():
+    """A fresh database must be able to record revision 018's 35-character ID."""
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
+        cwd=BACKEND_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    sql = result.stdout
+    widen = "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)"
+    record_long_revision = "version_num='018_sync_range_delete_serialization'"
+    assert widen in sql
+    assert sql.index(widen) < sql.index(record_long_revision)

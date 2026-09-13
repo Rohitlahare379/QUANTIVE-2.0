@@ -235,12 +235,27 @@ class CaggRefreshService:
         if cagg_name not in self.cagg_names:
             raise ValueError(f"Unknown continuous aggregate {cagg_name!r}")
         statement = text(
-            f"CALL refresh_continuous_aggregate('{cagg_name}', :window_start, :window_end)"
+            # asyncpg cannot infer the type of bind parameters passed to a
+            # Timescale stored procedure.  Make the database contract explicit
+            # so real CAGG refreshes work independently of driver inference.
+            f"CALL refresh_continuous_aggregate("
+            f"'{cagg_name}', "
+            f"CAST(:window_start AS timestamptz), "
+            f"CAST(:window_end AS timestamptz)"
+            f")"
         )
 
         async with self.session_factory() as session:
+            # ``refresh_continuous_aggregate`` is a Timescale procedure that
+            # PostgreSQL requires to run outside an explicit transaction.  The
+            # durable lease state is intentionally managed by separate short
+            # transactions, so this dedicated refresh connection can safely use
+            # autocommit without weakening ownership fencing.
+            connection = await session.connection(
+                execution_options={"isolation_level": "AUTOCOMMIT"}
+            )
             execute_task = asyncio.create_task(
-                session.execute(
+                connection.execute(
                     statement,
                     {"window_start": window_start, "window_end": window_end},
                 )
@@ -258,7 +273,6 @@ class CaggRefreshService:
                         pass
                     raise LeaseLostError(f"CAGG refresh claim lost for job {job_id}")
                 await execute_task
-                await session.commit()
             finally:
                 lost_task.cancel()
                 try:

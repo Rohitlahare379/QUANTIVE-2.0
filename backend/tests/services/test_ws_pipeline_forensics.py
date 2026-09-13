@@ -59,7 +59,7 @@ def create_candle(
     is_closed: bool = True,
     base_time: Optional[datetime] = None,
 ) -> CandleEvent:
-    base = base_time or datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+    base = base_time or datetime.now(timezone.utc).replace(second=0, microsecond=0)
     ts = base + timedelta(minutes=minute_offset)
     close_ts = ts + timedelta(seconds=59, milliseconds=999)
     return CandleEvent(
@@ -601,9 +601,9 @@ async def test_market_anomaly_out_of_order_duplicate_late_arrival():
     await pipeline.start()
 
     try:
-        t0 = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
-        t1 = datetime(2026, 8, 15, 10, 1, tzinfo=timezone.utc)
-        t2 = datetime(2026, 8, 15, 10, 2, tzinfo=timezone.utc)
+        t0 = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        t1 = t0 + timedelta(minutes=1)
+        t2 = t0 + timedelta(minutes=2)
 
         # Part 1 & 3: Missing candle (10:00 and 10:02) in batch 1
         await pipeline.enqueue_candle(create_candle(symbol="TESTANOMALY", base_time=t0))
@@ -662,7 +662,7 @@ async def test_real_postgresql_persistence_benchmark():
 
     service = IngestionService(db_session=None)
     num_candles = 1000
-    base_time = datetime(2026, 8, 15, 0, 0, tzinfo=timezone.utc)
+    base_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     batch = [
         {
             "asset_id": 20,

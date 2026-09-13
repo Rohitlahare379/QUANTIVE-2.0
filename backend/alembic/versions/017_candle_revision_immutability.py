@@ -11,6 +11,7 @@ operational scripts and future services can issue direct SQL.
 """
 
 from alembic import op
+import sqlalchemy as sa
 
 
 revision = "017_candle_revision_immutability"
@@ -20,6 +21,17 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Alembic's default version table uses VARCHAR(32).  The next revision ID
+    # is longer, so widen it before Alembic records this revision and proceeds
+    # to migration 018.  This is intentionally in the last 32-character
+    # revision that precedes the longer ID.
+    op.alter_column(
+        "alembic_version",
+        "version_num",
+        existing_type=sa.String(length=32),
+        type_=sa.String(length=64),
+        existing_nullable=False,
+    )
     # A raw row can be deliberately removed by an operational repair/retention
     # action.  Its prior revisions remain for lineage, so a later re-ingest of
     # the same asset/minute must not restart at revision one and collide with
@@ -184,6 +196,15 @@ def downgrade() -> None:
         END;
         $$ LANGUAGE plpgsql;
         """
+    )
+    # The current revision ID is still 32 characters while this downgrade runs,
+    # so returning the version table to its original shape is safe.
+    op.alter_column(
+        "alembic_version",
+        "version_num",
+        existing_type=sa.String(length=64),
+        type_=sa.String(length=32),
+        existing_nullable=False,
     )
     op.execute(
         """

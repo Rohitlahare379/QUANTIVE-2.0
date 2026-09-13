@@ -100,7 +100,10 @@ def create_candle(
     base_time: Optional[datetime] = None,
 ) -> CandleEvent:
     """Helper to create valid synthetic CandleEvents."""
-    base = base_time or datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+    # WebSocket events are live data.  Keep the default inside the canonical
+    # live-ingestion window so this real PostgreSQL test exercises raw
+    # persistence rather than intentionally historical staging behavior.
+    base = base_time or datetime.now(timezone.utc).replace(second=0, microsecond=0)
     ts = base + timedelta(minutes=minute_offset)
     close_ts = ts + timedelta(seconds=59, milliseconds=999)
     return CandleEvent(

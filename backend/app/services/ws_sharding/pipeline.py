@@ -18,7 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.connectors.models import CandleEvent
 from app.core.config import settings
-from app.services.ws_sharding.metrics import PipelineMetrics
+from app.services.ws_sharding.metrics import (
+    PipelineMetrics,
+    publish_pipeline_metrics,
+    record_pipeline_outcome,
+)
 from app.services.ws_sharding.persistence_fence import ShardPersistenceFenceLostError
 from app.services.ws_sharding.registry import (
     AssetRegistryResolver,
@@ -139,22 +143,26 @@ class BoundedLiveIngestionPipeline:
         Returns True if successfully queued, False if rejected or dropped.
         """
         if not self._is_running:
+            record_pipeline_outcome(self.shard_id, "rejected_not_running")
             return False
 
         # 1. Defensive Validation
         if not validate_candle_payload(event):
             self.metrics.rejected_candles += 1
+            record_pipeline_outcome(self.shard_id, "rejected_validation")
             logger.debug(f"[Shard {self.shard_id}] Rejected invalid candle: {event}")
             return False
 
         # 2. Check Fencing
         if self.fencing_check and not self.fencing_check():
             self.metrics.fenced_events_discarded += 1
+            record_pipeline_outcome(self.shard_id, "discarded_fenced")
             return False
 
         # 3. Check Per-Asset Buffer Limit (Section 8)
         if self._pending_per_asset[event.symbol] >= self.max_pending_per_asset:
             self.metrics.asset_overflow_count += 1
+            record_pipeline_outcome(self.shard_id, "dropped_asset_backpressure")
             logger.warning(
                 f"[Shard {self.shard_id}] Asset {event.symbol} pending queue reached limit "
                 f"({self.max_pending_per_asset}). Rejecting new events until drained."
@@ -171,6 +179,7 @@ class BoundedLiveIngestionPipeline:
                 await asyncio.wait_for(self._queue.put(event), timeout=2.0)
             except (asyncio.TimeoutError, asyncio.QueueFull):
                 self.metrics.queue_overflow_count += 1
+                record_pipeline_outcome(self.shard_id, "dropped_queue_backpressure")
                 logger.warning(
                     f"[Shard {self.shard_id}] Queue full ({self.queue_maxsize}). Dropping event under backpressure.",
                     extra={"shard_id": self.shard_id, "event": "queue_overflow"}
@@ -199,6 +208,7 @@ class BoundedLiveIngestionPipeline:
         if self._is_running:
             return
         self._is_running = True
+        publish_pipeline_metrics(self.shard_id, self.metrics)
         self._flush_trigger_event.clear()
         self._flusher_task = asyncio.create_task(
             self._flusher_loop(),
@@ -237,6 +247,7 @@ class BoundedLiveIngestionPipeline:
             self.discard_uncommitted_buffers()
 
         logger.info(f"Stopped BoundedLiveIngestionPipeline for shard {self.shard_id}")
+        publish_pipeline_metrics(self.shard_id, self.metrics)
 
     def fence(self) -> int:
         """Synchronously fail closed and cancel future flush iterations.
@@ -268,6 +279,8 @@ class BoundedLiveIngestionPipeline:
         self._pending_per_asset.clear()
         self.metrics.fenced_events_discarded += count
         self.metrics.update_queue_stats(0, self.queue_maxsize)
+        publish_pipeline_metrics(self.shard_id, self.metrics)
+        record_pipeline_outcome(self.shard_id, "discarded_fenced", count)
         if count > 0:
             logger.warning(f"[Shard {self.shard_id}] Discarded {count} in-memory queue items due to fencing.")
         return count
@@ -324,6 +337,7 @@ class BoundedLiveIngestionPipeline:
             max_size=self.queue_maxsize,
             degraded_threshold=settings.WS_QUEUE_DEGRADED_THRESHOLD,
         )
+        publish_pipeline_metrics(self.shard_id, self.metrics)
         return batch
 
     async def drain_and_flush(self) -> int:
@@ -443,6 +457,7 @@ class BoundedLiveIngestionPipeline:
                 await self._commit_asset_batch(asset_id, candles_payload)
             except Exception as e:
                 self.metrics.persistence_errors += 1
+                record_pipeline_outcome(self.shard_id, "persistence_error")
                 logger.error(
                     f"[Shard {self.shard_id}] Failed to commit {len(candles_payload)} candles for asset {asset_id}: {e}",
                     extra={"shard_id": self.shard_id, "asset_id": asset_id, "error": str(e), "event": "persistence_error"}
@@ -459,6 +474,8 @@ class BoundedLiveIngestionPipeline:
             # If running in mock/offline mode, record completion
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             self.metrics.record_flush_complete(len(candles_payload), latency_ms)
+            publish_pipeline_metrics(self.shard_id, self.metrics)
+            record_pipeline_outcome(self.shard_id, "persisted", len(candles_payload))
             return
 
         try:
@@ -484,9 +501,12 @@ class BoundedLiveIngestionPipeline:
 
             latency_ms = (time.perf_counter() - start_time) * 1000.0
             self.metrics.record_flush_complete(len(candles_payload), latency_ms)
+            publish_pipeline_metrics(self.shard_id, self.metrics)
+            record_pipeline_outcome(self.shard_id, "persisted", len(candles_payload))
 
         except ShardPersistenceFenceLostError as e:
             self.metrics.persistence_errors += 1
+            record_pipeline_outcome(self.shard_id, "persistence_fence_lost")
             message = f"persistence ownership lost: {e}"
             logger.error(
                 "[Shard %s] %s",
@@ -500,6 +520,7 @@ class BoundedLiveIngestionPipeline:
                 self.fence()
         except Exception as e:
             self.metrics.persistence_errors += 1
+            record_pipeline_outcome(self.shard_id, "persistence_error")
             logger.error(
                 f"[Shard {self.shard_id}] Failed to commit {len(candles_payload)} candles for asset {asset_id}: {e}",
                 extra={"shard_id": self.shard_id, "asset_id": asset_id, "error": str(e), "event": "persistence_error"}

@@ -2,6 +2,12 @@ from ipaddress import ip_network
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+# Binance permits no more than 1,024 streams on one WebSocket connection.  Keep
+# the vendor hard limit in one place: operators may choose a smaller capacity,
+# but configuration must never permit a larger connection.
+BINANCE_WEBSOCKET_STREAM_HARD_LIMIT = 1_024
+
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Quantive API"
     ENVIRONMENT: str = "development"
@@ -29,6 +35,7 @@ class Settings(BaseSettings):
     BINANCE_WS_PING_INTERVAL_SECONDS: float = 180.0
     BINANCE_WS_PING_TIMEOUT_SECONDS: float = 20.0
     BINANCE_WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS: float = 10.0
+    BINANCE_WS_MAX_STREAMS_PER_CONNECTION: int = BINANCE_WEBSOCKET_STREAM_HARD_LIMIT
     
     # Binance Rate Limiting (Token Bucket)
     # Binance limit: 1200 weight/min. We cap at 1000 for safety.
@@ -96,6 +103,13 @@ class Settings(BaseSettings):
     WS_QUEUE_WARNING_THRESHOLD: float = 0.75
     WS_QUEUE_DEGRADED_THRESHOLD: float = 0.90
     WS_MAX_PENDING_PER_ASSET: int = 2000
+
+    # Public list/status endpoints are bounded at the database boundary.  The
+    # defaults are deliberately modest; operators can raise them only up to a
+    # separately validated maximum when their database capacity supports it.
+    API_DEFAULT_PAGE_SIZE: int = 100
+    API_MAX_ASSET_PAGE_SIZE: int = 500
+    API_MAX_SYNC_RANGE_PAGE_SIZE: int = 500
     
     # S3 / MinIO Settings for Historical Exports
     AWS_ACCESS_KEY_ID: str = "minioadmin"
@@ -151,6 +165,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "BINANCE_WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS must be positive, "
                 f"got {self.BINANCE_WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS}"
+            )
+        if not 0 < self.BINANCE_WS_MAX_STREAMS_PER_CONNECTION <= BINANCE_WEBSOCKET_STREAM_HARD_LIMIT:
+            raise ValueError(
+                "BINANCE_WS_MAX_STREAMS_PER_CONNECTION must be between 1 and "
+                f"{BINANCE_WEBSOCKET_STREAM_HARD_LIMIT}"
             )
         if self.BINANCE_GLOBAL_WEIGHT_CAPACITY <= 0:
             raise ValueError(
@@ -238,9 +257,16 @@ class Settings(BaseSettings):
             ("HISTORICAL_MERGE_MAX_JOBS_PER_RUN", self.HISTORICAL_MERGE_MAX_JOBS_PER_RUN),
             ("HISTORICAL_MERGE_MAX_SCHEDULE_DAYS", self.HISTORICAL_MERGE_MAX_SCHEDULE_DAYS),
             ("HISTORICAL_MERGE_PAGE_SIZE", self.HISTORICAL_MERGE_PAGE_SIZE),
+            ("API_DEFAULT_PAGE_SIZE", self.API_DEFAULT_PAGE_SIZE),
+            ("API_MAX_ASSET_PAGE_SIZE", self.API_MAX_ASSET_PAGE_SIZE),
+            ("API_MAX_SYNC_RANGE_PAGE_SIZE", self.API_MAX_SYNC_RANGE_PAGE_SIZE),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value}")
+        if self.API_DEFAULT_PAGE_SIZE > self.API_MAX_ASSET_PAGE_SIZE:
+            raise ValueError("API_DEFAULT_PAGE_SIZE cannot exceed API_MAX_ASSET_PAGE_SIZE")
+        if self.API_DEFAULT_PAGE_SIZE > self.API_MAX_SYNC_RANGE_PAGE_SIZE:
+            raise ValueError("API_DEFAULT_PAGE_SIZE cannot exceed API_MAX_SYNC_RANGE_PAGE_SIZE")
         # Development defaults are intentionally convenient for local unit
         # tests, but a production process must refuse to boot with them.  A
         # silent fallback here would turn a missing deployment secret into

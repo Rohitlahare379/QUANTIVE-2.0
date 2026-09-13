@@ -59,9 +59,15 @@ def build_subscription_payload(streams: List[str], req_id: int = 1) -> str:
     if not streams:
         raise ValueError("Streams list cannot be empty for subscription")
     
+    unique_streams = sorted(set(streams))
+    if len(unique_streams) > settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION:
+        raise ValueError(
+            "Binance subscription exceeds configured per-connection stream capacity "
+            f"({len(unique_streams)} > {settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION})"
+        )
     payload = {
         "method": "SUBSCRIBE",
-        "params": sorted(list(set(streams))),
+        "params": unique_streams,
         "id": req_id,
     }
     return json.dumps(payload)
@@ -110,7 +116,12 @@ class BinanceWebSocketClient:
         if not symbols:
             raise InvalidSymbolError("BinanceWebSocketClient requires at least one symbol")
 
-        self.symbols = [normalize_symbol(s) for s in symbols]
+        self.symbols = sorted({normalize_symbol(s) for s in symbols})
+        if len(self.symbols) > settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION:
+            raise InvalidSymbolError(
+                "BinanceWebSocketClient received more streams than one Binance connection can own: "
+                f"{len(self.symbols)} > {settings.BINANCE_WS_MAX_STREAMS_PER_CONNECTION}"
+            )
         self.interval = interval.strip().lower()
         self.ws_base_url = (ws_base_url or settings.BINANCE_WS_BASE_URL).rstrip("/")
         self.max_connection_lifetime = (

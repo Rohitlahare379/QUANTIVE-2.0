@@ -22,6 +22,22 @@ depends_on = None
 _TABLES = ("raw_1m_candles", "gap_staging_candles")
 
 
+def _disable_raw_compression_for_schema_change() -> None:
+    """Timescale rejects ALTER TABLE ADD CONSTRAINT while compression is enabled."""
+    op.execute("ALTER TABLE raw_1m_candles SET (timescaledb.compress = false)")
+
+
+def _restore_raw_compression() -> None:
+    """Restore the compression settings established by the base schema."""
+    op.execute(
+        "ALTER TABLE raw_1m_candles SET ("
+        "timescaledb.compress = true, "
+        "timescaledb.compress_segmentby = 'asset_id', "
+        "timescaledb.compress_orderby = 'timestamp DESC'"
+        ")"
+    )
+
+
 def _add_integrity_columns(table_name: str) -> None:
     # Existing rows predate source capture.  Preserve that fact rather than
     # misrepresenting them as received from a live connector.
@@ -63,9 +79,15 @@ def _add_integrity_constraints(table_name: str) -> None:
 
 
 def upgrade() -> None:
+    # ``raw_1m_candles`` has compression enabled in revision 001.  Temporarily
+    # disable it before adding check constraints; Timescale does not permit the
+    # schema operation otherwise.  Compression is restored immediately after
+    # the raw table is hardened, before normal ingestion resumes.
+    _disable_raw_compression_for_schema_change()
     for table_name in _TABLES:
         _add_integrity_columns(table_name)
         _add_integrity_constraints(table_name)
+    _restore_raw_compression()
 
     op.create_table(
         "candle_revisions",

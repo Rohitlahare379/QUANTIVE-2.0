@@ -27,6 +27,7 @@ Covers all 20 required verification scenarios:
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+from typing import Dict
 import pytest
 import pytest_asyncio
 import websockets
@@ -278,6 +279,16 @@ def test_17_subscription_failure_on_empty():
 
     with pytest.raises(InvalidSymbolError, match="requires at least one symbol"):
         BinanceWebSocketClient(symbols=[])
+
+
+def test_subscription_capacity_is_enforced_before_any_network_connection():
+    symbols = [f"CAPACITY{i:04d}USDT" for i in range(1_025)]
+    streams = [build_kline_stream_name(symbol) for symbol in symbols]
+
+    with pytest.raises(ValueError, match="exceeds configured per-connection stream capacity"):
+        build_subscription_payload(streams)
+    with pytest.raises(InvalidSymbolError, match="more streams than one Binance connection can own"):
+        BinanceWebSocketClient(symbols=symbols)
 
 
 @pytest.mark.asyncio
